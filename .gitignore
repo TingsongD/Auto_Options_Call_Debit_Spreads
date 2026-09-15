@@ -1,0 +1,21 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Secrets and licensed data — never commit (spec SS11.4)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# OS noise
+.DS_Store
