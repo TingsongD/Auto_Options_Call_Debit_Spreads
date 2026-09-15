@@ -7,13 +7,10 @@ requires-python = ">=3.12,<3.13"
 dependencies = [
     "alembic>=1.13",
     "duckdb>=1.1",
-    "jsonschema>=4.26.0",
     "langgraph>=0.2",
     "openai>=1.50",
-    "plotly>=5.24",
     "polars>=1.8",
     "psycopg[binary]>=3.2",
-    "pyarrow>=17",
     "pydantic>=2.9",
     "pytz>=2026.3.post1",
     "pyyaml>=6.0.3",
@@ -25,6 +22,7 @@ dependencies = [
 [dependency-groups]
 dev = [
     "hypothesis>=6.112",
+    "jsonschema>=4.26.0",
     "mypy>=1.11",
     "pytest>=8.3",
     "ruff>=0.6",

@@ -153,6 +153,7 @@ def test_inference_role_denied(pg):
                 {"r": rid},
             )
         conn.execute(sa.text("ROLLBACK TO SAVEPOINT sp1"))
+        conn.execute(sa.text("RESET ROLE"))
         conn.rollback()
 
 
@@ -167,4 +168,5 @@ def test_run_scoped_rls(pg):
         conn.execute(sa.text("SELECT set_config('app.run_id', :r, false)"), {"r": rid_a})
         rows = conn.execute(sa.text("SELECT run_id FROM events")).all()
         assert {r.run_id for r in rows} == {rid_a}
+        conn.execute(sa.text("RESET ROLE"))
         conn.rollback()

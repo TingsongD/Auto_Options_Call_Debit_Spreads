@@ -29,10 +29,16 @@ class DecisionTape:
         self.path = Path(path)
         self._records: dict[str, TapeRecord] = {}
         if self.path.is_file():
-            for line in self.path.read_text().splitlines():
+            lines = self.path.read_text().splitlines()
+            for i, line in enumerate(lines):
                 if not line.strip():
                     continue
-                raw = json.loads(line)
+                try:
+                    raw = json.loads(line)
+                except json.JSONDecodeError:
+                    if i == len(lines) - 1:
+                        continue  # torn tail from a crash mid-append: ignore
+                    raise
                 resp = raw["response"]
                 self._records[raw["request_hash"]] = TapeRecord(
                     request_hash=raw["request_hash"],

@@ -142,8 +142,12 @@ def run(
         loss_activation_days=profile.exit_policy.loss_activation_days_held,
     )
     if store == "postgres":
+        dsn = os.environ.get("SPX_DB_DSN")
+        if not dsn:
+            typer.secho("SPX_DB_DSN is not set", fg=typer.colors.RED, err=True)
+            raise typer.Exit(2)
         event_store: InMemoryEventStore | PostgresEventStore = PostgresEventStore(
-            create_engine(os.environ["SPX_DB_DSN"])
+            create_engine(dsn)
         )
     elif store == "memory":
         event_store = InMemoryEventStore()
@@ -175,7 +179,22 @@ def migrate() -> None:
 
     from alembic import command
 
-    cfg = Config(str(Path(__file__).resolve().parents[3] / "alembic.ini"))
+    ini = next(
+        (
+            p / "alembic.ini"
+            for p in (Path.cwd(), *Path.cwd().parents)
+            if (p / "alembic.ini").exists()
+        ),
+        None,
+    )
+    if ini is None:
+        typer.secho("alembic.ini not found (run from the repo root)", fg=typer.colors.RED, err=True)
+        raise typer.Exit(2)
+    if "SPX_DB_DSN" not in os.environ:
+        typer.secho("SPX_DB_DSN is not set", fg=typer.colors.RED, err=True)
+        raise typer.Exit(2)
+    cfg = Config(str(ini))
+    cfg.set_main_option("script_location", str(ini.parent / "alembic"))
     command.upgrade(cfg, "head")
     typer.secho("OK: migrations applied", fg=typer.colors.GREEN)
 

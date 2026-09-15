@@ -29,6 +29,7 @@ class Budget:
         self.sheet = sheet
         self.committed = Decimal(0)
         self.reserved = Decimal(0)
+        self.overrun = False  # set when actuals exceed the cap (reserve gate missed)
 
     def estimate(self, input_tokens: int, output_tokens: int) -> Decimal:
         s = self.sheet
@@ -47,6 +48,8 @@ class Budget:
     def commit(self, reservation: Decimal, actual: Decimal) -> None:
         self.reserved -= reservation
         self.committed += actual
+        if self.committed + self.reserved > self.cap:
+            self.overrun = True
 
     def abort(self, reservation: Decimal) -> None:
         self.reserved -= reservation

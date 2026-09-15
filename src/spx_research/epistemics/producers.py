@@ -140,14 +140,13 @@ def manager_menu(view: ManagerView, atoms: list[Atom]) -> list[MenuChoice]:
     menu.append(MenuChoice("act-allocate", "ALLOCATE", base + deficits))
     menu.append(MenuChoice("act-pause", "PAUSE_NEW_ALLOCATIONS", base))
     menu.append(MenuChoice("act-resume", "RESUME_NEW_ALLOCATIONS", base))
-    live = [r for r in view.reservations]
-    if live:
+    for r in view.reservations:
         menu.append(
             MenuChoice(
-                "act-retire",
+                f"act-retire:{r.reservation_id}",
                 "RETIRE_SEARCH_SLOTS",
                 base,
-                target_internal_id=live[0].reservation_id,
+                target_internal_id=r.reservation_id,
             )
         )
     return menu

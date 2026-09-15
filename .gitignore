@@ -19,3 +19,10 @@ secrets/
 
 # OS noise
 .DS_Store
+
+# Tool caches
+.hypothesis/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+out/

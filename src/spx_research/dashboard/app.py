@@ -65,7 +65,7 @@ def main() -> None:  # pragma: no cover - streamlit entry point
     c1, c2, c3 = st.columns(3)
     c1.metric("events", summary["total_events"])
     c2.metric("last seq", summary["last_seq"])
-    c3.metric("cash", run["report"].get("final_cash", "n/a"))
+    c3.metric("cash", run["report"].get("final_cash_usd", "n/a"))
     st.subheader("Event types")
     st.bar_chart(summary["by_type"])
     st.subheader("Report")
