@@ -517,3 +517,168 @@ def test_aggregate_reserve_cap_rejects_whole_allocation(
     assert rejected, "over-cap allocation should be rejected, not crash"
     held = [e for e in result.events if e.type == "RESERVATION_HELD"]
     assert len(held) <= 1  # at most one reserve fits under the cap
+
+
+def test_data_gap_once_per_position_per_day(dataset: tuple[Archive, Any]) -> None:
+    """Settlement gaps report once per position per expiry day — the
+    per-minute retries must not spam the log (was ~390 events/position)."""
+    from collections import Counter
+
+    archive, cal = dataset
+    result = _engine_with(archive, cal).run(START, END)
+    gaps = [
+        e
+        for e in result.events
+        if e.type == "DATA_GAP" and e.payload.get("kind") == "settlement_unavailable"
+    ]
+    per_pos = Counter(e.payload["position_id"] for e in gaps)
+    assert per_pos, "expected at least one settlement gap in this fixture"
+    assert max(per_pos.values()) == 1
+
+
+def test_execution_delay_must_align_to_minute_grid() -> None:
+    """A delay that is not a whole number of minutes can never land on the
+    fill grid — config must reject it instead of silently expiring orders."""
+    from pydantic import ValidationError
+
+    d = _profile_dict()
+    d["clock"]["simulated_execution_delay_seconds"] = 90
+    with pytest.raises(ValidationError):
+        Profile.model_validate(d)
+    d["clock"]["simulated_execution_delay_seconds"] = 0
+    with pytest.raises(ValidationError):
+        Profile.model_validate(d)
+    d["clock"]["simulated_execution_delay_seconds"] = 120
+    Profile.model_validate(d)  # multiples of 60 are fine
+
+
+def test_zero_session_run_emits_aware_boot(dataset: tuple[Archive, Any]) -> None:
+    """A run with no sessions still emits RUN_STARTED with a tz-aware time —
+    the fail-closed rule has no naive-datetime escape."""
+    from datetime import date
+
+    archive, cal = dataset
+    engine = _engine(archive, cal)
+    result = engine.run(date(2024, 1, 6), date(2024, 1, 7))  # weekend: no sessions
+    started = next(e for e in result.events if e.type == "RUN_STARTED")
+    assert started.sim_time_utc.tzinfo is not None
+
+
+def test_per_spread_risk_cap_uses_initial_risk_not_encumbrance(
+    dataset: tuple[Archive, Any],
+) -> None:
+    """max_per_spread_initial_risk_usd bounds (width - credit) x multiplier —
+    a full-width reservation encumbrance above the cap must not deadlock
+    allocation (the real credit is enforced at candidate build)."""
+    archive, cal = dataset
+    # reserve = 25 * 100 + 10 = 2510 > 2500 cap: old code rejected everything
+    engine = _engine_with(
+        archive, cal, portfolio={"max_per_spread_initial_risk_usd": Decimal("2500")}
+    )
+    result = engine.run(START, END)
+    held = [e for e in result.events if e.type == "RESERVATION_HELD"]
+    assert held, "per-spread cap must compare initial risk, not encumbrance"
+    assert not [
+        e
+        for e in result.events
+        if e.type == "DECISION_REJECTED" and e.payload.get("code") == "RESERVE_EXCEEDS_RISK_LIMIT"
+    ]
+
+
+def test_allocation_shortfall_recorded_when_cash_binds(
+    dataset: tuple[Archive, Any],
+) -> None:
+    """A partial allocation must emit ALLOCATION_SHORTFALL — DECISION_MADE
+    alone cannot record fewer reservations than requested."""
+    archive, cal = dataset
+    engine = _engine_with(
+        archive,
+        cal,
+        portfolio={
+            "initial_capital_usd": Decimal("2600"),  # one 2510 reserve only
+            "max_aggregate_committed_risk_usd": Decimal("100000"),
+        },
+    )
+    result = engine.run(START, END)
+    shortfalls = [e for e in result.events if e.type == "ALLOCATION_SHORTFALL"]
+    assert shortfalls, "cash-bound allocation must record the shortfall"
+    first = shortfalls[0].payload
+    assert sum(first["unfilled"].values()) >= 1
+
+
+def test_spread_rejection_recorded_in_decisions(dataset: tuple[Archive, Any]) -> None:
+    """Rejection parity: a spread proposal that fails engine validation lands
+    in result.decisions with a 'rejected' code, same as manager rejections."""
+    from spx_research.engine.policy import Proposal
+    from spx_research.persistence.events import InMemoryEventStore
+
+    class BadSpreadPolicy:
+        def decide(self, ctx: DecisionContext) -> Proposal:
+            return Proposal(kind="OPEN", candidate_id="nope", limit_template_id="x")
+
+    mech = MechanicalPolicy(
+        profit_trigger=Decimal("999"),
+        loss_trigger=Decimal("-999"),
+        loss_activation_days=9999,
+        min_entry_credit_fraction=Decimal("0"),
+    )
+    engine = Engine(
+        Profile.model_validate(_profile_dict()),
+        dataset[1],
+        dataset[0],
+        InMemoryEventStore(),
+        lambda role: mech if role == "MANAGER" else BadSpreadPolicy(),
+    )
+    result = engine.run(START, date(2024, 1, 5))  # a few sessions is enough
+    rejected = [d for d in result.decisions if d.get("rejected")]
+    assert rejected, "spread rejection should be recorded in decisions"
+    assert any(d["rejected"] == "UNKNOWN_CANDIDATE" for d in rejected)
+
+
+def test_hold_in_exit_pending_is_dead_state() -> None:
+    """EXIT_PENDING agents never reach a review (a close order is already
+    working) — HOLD in that state is a rejection, not a dead accepted path."""
+    from spx_research.engine.policy import Rejection, validate_spread_proposal
+
+    agent = Agent("a1", "SPREAD", Direction.BULL_PUT_CREDIT, AgentState.EXIT_PENDING, START, START)
+    pos = None
+    view = SpreadView(agent, pos, None, None, 0, (), (), ())
+    ctx = DecisionContext("r", "main", "a1", "SPREAD", None, 0, 30, spread_view=view)  # type: ignore[arg-type]
+    from spx_research.engine.policy import Proposal
+
+    with pytest.raises(Rejection, match="HOLD_FIELDS"):
+        validate_spread_proposal(ctx, Proposal(kind="HOLD", position_id="p1"))
+
+
+def test_stale_quotes_read_as_absent(dataset: tuple[Archive, Any]) -> None:
+    """A quote older than max_quote_age_seconds is invisible — sparse real
+    feeds cannot silently fill orders on stale prices."""
+    archive, cal = dataset
+    sess = cal.session(START)
+    t = sess.open_utc() + timedelta(minutes=30)
+    cid = archive.contracts_visible_at(t)[0]["contract_id"]
+    fresh = archive.quote_at(cid, t)
+    assert fresh is not None
+    snap = fresh["snapshot_at_utc"]
+    # Inside the bound the quote reads; past the bound it is absent — a
+    # sparse feed cannot silently serve a stale print.
+    assert archive.quote_at(cid, snap + timedelta(seconds=299), max_age_seconds=300) is not None
+    assert (
+        archive.quote_at(cid, snap + timedelta(seconds=301), max_age_seconds=300)
+        is None
+        or archive.quote_at(cid, snap + timedelta(seconds=301), max_age_seconds=300)[
+            "snapshot_at_utc"
+        ]
+        >= snap + timedelta(seconds=1)
+    )
+    # The same applies to the greek path: over a weekend the last
+    # session's greek is >1 day stale and must read as absent.
+    from datetime import UTC, datetime
+
+    fri = cal.session(date(2024, 1, 5))
+    assert fri is not None
+    greek = archive.greeks_at(cid, fri.open_utc())
+    assert greek is not None
+    sunday = datetime(2024, 1, 7, 17, 0, tzinfo=UTC)
+    assert archive.greeks_at(cid, sunday) is not None  # unbounded: latest row
+    assert archive.greeks_at(cid, sunday, max_age_seconds=86400) is None

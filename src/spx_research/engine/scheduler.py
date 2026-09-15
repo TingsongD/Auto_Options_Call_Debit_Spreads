@@ -107,6 +107,7 @@ class Engine:
         self._id_counter = 0
         self._manager_due = False
         self.decisions: list[dict[str, Any]] = []
+        self._gap_reported: set[tuple[str, date]] = set()
 
     # -- ids & events -----------------------------------------------------
 
@@ -136,7 +137,11 @@ class Engine:
     def run(self, start: date, end: date) -> RunResult:
         p = self.profile
         first = self.calendar.session_days(start, end)
-        boot = first[0].open_utc() if first else datetime.combine(start, datetime.min.time())
+        boot = (
+            first[0].open_utc()
+            if first
+            else datetime.combine(start, datetime.min.time(), tzinfo=UTC_TZ)
+        )
         assert p.portfolio is not None
         self._emit(
             boot,
@@ -157,6 +162,7 @@ class Engine:
     def _session(self, sess: SessionDay, session_index: int) -> datetime:
         p = self.profile
         assert p.clock is not None
+        self._gap_reported.clear()  # settlement gaps report once per position per day
         grid = set(self.calendar.review_times(sess.day, p.clock.agent_review_minutes))
         first_review = min(grid) if grid else None
         last_offset = sess.minute_offsets()[-1]
@@ -198,9 +204,11 @@ class Engine:
                 or st["simulated_available_at_utc"] > t
                 or st.get("value_index_points") is None
             ):
-                if expiry == day:
-                    # Report the gap on the expiry day only; later-session
-                    # retries stay quiet to avoid DATA_GAP spam.
+                gap_key = (pos.position_id, day)
+                if expiry == day and gap_key not in self._gap_reported:
+                    # Report the gap once per position per expiry day; the
+                    # per-minute retries and later-session retries stay quiet.
+                    self._gap_reported.add(gap_key)
                     self._emit(
                         t,
                         "SETTLEMENT",
@@ -242,8 +250,15 @@ class Engine:
                 if order.intent is OrderIntent.CLOSE
                 else ex.opening_fee_per_leg_usd
             ) or Decimal(0)
-            sq_row = self.archive.quote_at(order.spread.short.contract_id, t)
-            lq_row = self.archive.quote_at(order.spread.long.contract_id, t)
+            max_quote_age = (
+                self.profile.quality.max_quote_age_seconds if self.profile.quality else None
+            )
+            sq_row = self.archive.quote_at(
+                order.spread.short.contract_id, t, max_age_seconds=max_quote_age
+            )
+            lq_row = self.archive.quote_at(
+                order.spread.long.contract_id, t, max_age_seconds=max_quote_age
+            )
             short_q = _quote_from_row(sq_row) if sq_row else None
             long_q = _quote_from_row(lq_row) if lq_row else None
             pkg = PackageOrder(
@@ -506,19 +521,40 @@ class Engine:
         )
         return reserve_required_usd(max_width, mult, buffer)
 
+    def _committed_risk_usd(self) -> Decimal:
+        """Worst-case loss of everything already committed: open positions at
+        their true initial risk (width - entry credit) x multiplier, plus live
+        reservations at their full encumbrance (their future credit is not
+        yet known, so reserve is the conservative bound)."""
+        total = Decimal(0)
+        for pos in self.state.open_positions():
+            width = pos.spread.width_points
+            total += (width - pos.entry_credit_points) * pos.spread.multiplier
+        for res in self.state.reservations.values():
+            if res.status in (ReservationStatus.SEEKING_ENTRY, ReservationStatus.ENTRY_PENDING):
+                total += res.reserve_usd
+        return total
+
     def _check_manager_capacity(self, p: Proposal, t: datetime) -> None:
         """Validate an ALLOCATE against risk caps before it is committed —
-        over-cap is a policy Rejection, not a crash (H3)."""
+        over-cap is a policy Rejection, not a crash (H3).
+
+        The aggregate cap compares *initial risk* — positions at
+        (width - credit) x multiplier, reservations at reserve — against the
+        proposed new commitments. The per-spread cap is enforced at candidate
+        build time where the real credit is known; comparing a reservation's
+        full-width encumbrance to an initial-risk cap would reject every
+        allocation regardless of actual risk."""
         if p.kind != "ALLOCATE" or not p.allocation:
             return
         assert self.profile.portfolio is not None
         reserve = self._reservation_reserve_usd(t)
         n_new = sum(p.allocation.values())
-        per_spread = self.profile.portfolio.max_per_spread_initial_risk_usd
         aggregate = self.profile.portfolio.max_aggregate_committed_risk_usd
-        if per_spread is not None and reserve > per_spread:
-            raise Rejection("RESERVE_EXCEEDS_RISK_LIMIT")
-        if aggregate is not None and self.state.account.reserved + reserve * n_new > aggregate:
+        if (
+            aggregate is not None
+            and self._committed_risk_usd() + reserve * n_new > aggregate
+        ):
             raise Rejection("RESERVE_EXCEEDS_RISK_LIMIT")
 
     def _apply_manager(self, t: datetime, p: Proposal) -> None:
@@ -526,6 +562,8 @@ class Engine:
         assert prof.portfolio is not None and prof.universe is not None
         if p.kind == "ALLOCATE" and p.allocation:
             reserve = self._reservation_reserve_usd(t)
+            requested = dict(p.allocation)
+            allocated = {"bullish": 0, "bearish": 0}
             for direction_name in sorted(p.allocation):
                 direction = (
                     Direction.BULL_PUT_CREDIT
@@ -534,7 +572,8 @@ class Engine:
                 )
                 for _ in range(p.allocation[direction_name]):
                     if self.state.account.available() < reserve:
-                        break  # capacity check already ran; belt-and-suspenders
+                        break  # cash is the binding constraint, not the count
+                    allocated[direction_name] += 1
                     res_id, agent_id = self._new_id("res"), self._new_id("agent")
                     sess = self.calendar.session(self.calendar.ny_date(t))
                     close_t = sess.close_utc() if sess else t
@@ -565,6 +604,23 @@ class Engine:
                             "reservation_id": res_id,
                         },
                     )
+            shortfall = {
+                k: requested[k] - allocated[k]
+                for k in requested
+                if allocated[k] < requested[k]
+            }
+            if shortfall:
+                self._emit(
+                    t,
+                    "DECISION",
+                    "ALLOCATION_SHORTFALL",
+                    {
+                        "requested": requested,
+                        "allocated": allocated,
+                        "unfilled": shortfall,
+                        "available_usd": str(self.state.account.available()),
+                    },
+                )
         elif p.kind == "PAUSE_NEW_ALLOCATIONS":
             self._emit(t, "MANAGER", "MANAGER_PAUSED", {})
         elif p.kind == "RESUME_NEW_ALLOCATIONS":
@@ -612,6 +668,14 @@ class Engine:
                 continue
             except Rejection as e:
                 self._discard_pending(pol, ctx)
+                self.decisions.append(
+                    {
+                        "actor": agent.agent_id,
+                        "at": t.isoformat(),
+                        "proposal": proposal.kind,
+                        "rejected": e.code,
+                    }
+                )
                 self._emit(
                     t, "DECISION", "DECISION_REJECTED", {"actor_id": agent.agent_id, "code": e.code}
                 )
@@ -634,12 +698,23 @@ class Engine:
             self._commit_pending(pol, ctx)
 
     def _spread_view(self, agent: Any, sess: SessionDay, t: datetime) -> SpreadView:
+        quality = self.profile.quality
+        max_quote_age = quality.max_quote_age_seconds if quality else None
+        max_greek_age = quality.max_greek_age_seconds if quality else None
+        require_validated = bool(
+            getattr(self.profile.universe, "delta_requires_validated_source", True)
+            and getattr(quality, "fail_on_unvalidated_greeks_for_delta_filter", True)
+        )
         pos = self.state.positions.get(agent.position_id) if agent.position_id else None
         close_debit, frac, days = None, None, 0
         if pos and pos.status is PositionStatus.OPEN:
             assert self.profile.execution is not None
-            sq = self.archive.quote_at(pos.spread.short.contract_id, t)
-            lq = self.archive.quote_at(pos.spread.long.contract_id, t)
+            sq = self.archive.quote_at(
+                pos.spread.short.contract_id, t, max_age_seconds=max_quote_age
+            )
+            lq = self.archive.quote_at(
+                pos.spread.long.contract_id, t, max_age_seconds=max_quote_age
+            )
             if sq and lq:
                 close_debit = Decimal(str(sq["ask_points"])) - Decimal(str(lq["bid_points"]))
                 fee = self.profile.execution.closing_fee_per_leg_usd or Decimal(0)
@@ -673,6 +748,9 @@ class Engine:
                     max_candidates=self.profile.universe.max_candidates_per_direction,
                     target_dte=self.profile.universe.target_entry_dte_calendar_days,
                     allowed_roots=tuple(self.profile.universe.allowed_contract_roots),
+                    max_quote_age_seconds=max_quote_age,
+                    max_greek_age_seconds=max_greek_age,
+                    require_validated_greeks=require_validated,
                 )
             )
             # One approved limit template per candidate (natural quote-side credit).

@@ -72,6 +72,9 @@ def build_candidates(
     target_dte: int = 45,
     allowed_roots: tuple[str, ...] = (),
     version: str = "candidates-1",
+    max_quote_age_seconds: int | None = None,
+    max_greek_age_seconds: int | None = None,
+    require_validated_greeks: bool = True,
 ) -> list[Candidate]:
     """Deterministic eligible shortlist for one direction at one decision time."""
     as_of = require_aware(as_of)
@@ -91,7 +94,9 @@ def build_candidates(
             key=lambda c: c.strike_points,
         )
         by_strike = {c.strike_points: c for c in legs}
-        quotes = archive.session_quotes([c.contract_id for c in legs], as_of)
+        quotes = archive.session_quotes(
+            [c.contract_id for c in legs], as_of, max_age_seconds=max_quote_age_seconds
+        )
         for c in legs:
             for w in widths:
                 if direction is Direction.BULL_PUT_CREDIT:
@@ -113,8 +118,14 @@ def build_candidates(
                 credit = Decimal(str(sq["bid_points"])) - Decimal(str(lq["ask_points"]))
                 if credit <= 0:
                     continue
-                greek = archive.greeks_at(short_c.contract_id, as_of)
+                greek = archive.greeks_at(
+                    short_c.contract_id, as_of, max_age_seconds=max_greek_age_seconds
+                )
                 delta = None if greek is None else Decimal(str(greek["delta"]))
+                if require_validated_greeks and greek is not None and not greek.get(
+                    "methodology_id"
+                ):
+                    continue  # unvalidated Greeks never feed the delta filter
                 if delta is None or not delta_range[0] <= abs(delta) <= delta_range[1]:
                     continue  # unvalidated delta is an explicit ineligibility reason
                 max_loss = (w - credit) * spread.multiplier

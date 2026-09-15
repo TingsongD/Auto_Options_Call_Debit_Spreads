@@ -139,7 +139,7 @@ def validate_spread_proposal(ctx: DecisionContext, p: Proposal) -> None:
         if p.limit_template_id not in {t.template_id for t in view.entry_limit_templates}:
             raise Rejection("UNKNOWN_LIMIT_TEMPLATE")
     elif p.kind == "HOLD":
-        if state not in ("OPEN", "EXIT_PENDING") or not p.position_id or p.candidate_id:
+        if state != "OPEN" or not p.position_id or p.candidate_id:
             raise Rejection("HOLD_FIELDS")
         if view.position is None or view.position.position_id != p.position_id:
             raise Rejection("NOT_OWN_POSITION")

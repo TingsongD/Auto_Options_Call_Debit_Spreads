@@ -7,7 +7,7 @@ separate rows; the gateway returns what was visible, preserving earlier values.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -93,8 +93,13 @@ class Archive:
         ny_day = as_of.astimezone(NY).date()
         return self.root / "quotes" / f"session={ny_day.isoformat()}.parquet"
 
-    def quote_at(self, contract_id: str, as_of: datetime) -> dict[str, Any] | None:
-        """Latest usable quote from as_of's own session, or None (T29/T31)."""
+    def quote_at(
+        self, contract_id: str, as_of: datetime, max_age_seconds: int | None = None
+    ) -> dict[str, Any] | None:
+        """Latest usable quote from as_of's own session, or None (T29/T31).
+
+        ``max_age_seconds`` bounds snapshot staleness — a quote older than
+        the bound is treated as absent rather than silently traded on."""
         as_of = require_aware(as_of)
         if not self._ensure_session_quotes(as_of):
             return None
@@ -104,9 +109,21 @@ class Archive:
             "ORDER BY snapshot_at_utc DESC LIMIT 1",
             [contract_id, as_of],
         )
-        return rows[0] if rows else None
+        row = rows[0] if rows else None
+        if (
+            row is not None
+            and max_age_seconds is not None
+            and as_of - row["snapshot_at_utc"] > timedelta(seconds=max_age_seconds)
+        ):
+            return None
+        return row
 
-    def session_quotes(self, contract_ids: list[str], as_of: datetime) -> dict[str, dict[str, Any]]:
+    def session_quotes(
+        self,
+        contract_ids: list[str],
+        as_of: datetime,
+        max_age_seconds: int | None = None,
+    ) -> dict[str, dict[str, Any]]:
         """Latest usable same-session quote per contract, batched."""
         as_of = require_aware(as_of)
         if not self._ensure_session_quotes(as_of) or not contract_ids:
@@ -119,6 +136,9 @@ class Archive:
             "ORDER BY snapshot_at_utc DESC) = 1",
             [*contract_ids, as_of],
         )
+        if max_age_seconds is not None:
+            cutoff = as_of - timedelta(seconds=max_age_seconds)
+            rows = [r for r in rows if r["snapshot_at_utc"] >= cutoff]
         return {r["contract_id"]: r for r in rows}
 
     def quotes_at(self, contract_ids: list[str], as_of: datetime) -> dict[str, dict[str, Any]]:
@@ -135,7 +155,11 @@ class Archive:
         )
         return rows[0] if rows else None
 
-    def greeks_at(self, contract_id: str, as_of: datetime) -> dict[str, Any] | None:
+    def greeks_at(
+        self, contract_id: str, as_of: datetime, max_age_seconds: int | None = None
+    ) -> dict[str, Any] | None:
+        """Latest greek row visible at as_of; ``max_age_seconds`` bounds the
+        observation's age — a stale greek reads as absent."""
         as_of = require_aware(as_of)
         if not self._ensure_static("greeks", "meta/greeks.parquet"):
             return None
@@ -144,7 +168,14 @@ class Archive:
             "AND simulated_available_at_utc <= ? ORDER BY asof_utc DESC LIMIT 1",
             [contract_id, as_of],
         )
-        return rows[0] if rows else None
+        row = rows[0] if rows else None
+        if (
+            row is not None
+            and max_age_seconds is not None
+            and as_of - row["asof_utc"] > timedelta(seconds=max_age_seconds)
+        ):
+            return None
+        return row
 
     def macro_visible_at(
         self, as_of: datetime, series_id: str | None = None

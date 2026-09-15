@@ -89,6 +89,19 @@ class Clock(Section):
     def _parse_hhmm(cls, v: Any) -> time:
         return _hhmm(v)
 
+    @field_validator("simulated_execution_delay_seconds")
+    @classmethod
+    def _delay_on_grid(cls, v: int) -> int:
+        # Orders become eligible only at t + delay and fill at exactly that
+        # minute (T06); a delay that is not a whole number of market minutes
+        # can never land on the grid and silently expires every order.
+        if v <= 0 or v % 60 != 0:
+            raise ValueError(
+                "simulated_execution_delay_seconds must be a positive multiple of "
+                "market_resolution_seconds (60)"
+            )
+        return v
+
 
 class Study(Section):
     data_manifest_id: str | None = None
@@ -200,8 +213,9 @@ class Models(Section):
 
 
 class Quality(Section):
-    """Data-quality policy knobs. Reserved surface: parsed and validated but
-    not yet consumed by the engine — they land with the QA/ingest commands."""
+    """Data-quality policy knobs. ``max_*_age_seconds`` and
+    ``fail_on_unvalidated_greeks_for_delta_filter`` are consumed by the
+    engine; the remaining fields land with the QA/ingest commands."""
 
     missing_open_position_quote: str = "pause_validated_run"
     invalid_candidate_quote: str = "reject_candidate_and_report"
@@ -209,6 +223,11 @@ class Quality(Section):
     fail_on_future_feature: bool = True
     fail_on_unvalidated_greeks_for_delta_filter: bool = True
     fail_on_missing_settlement_value: bool = True
+    # Staleness bounds: a snapshot older than its bound is treated as absent.
+    # Quotes default to 5 minutes (synthetic series is minute-dense); Greeks
+    # default to a day (providers typically refresh once per session).
+    max_quote_age_seconds: int = 300
+    max_greek_age_seconds: int = 86400
 
 
 class HarnessCfg(Section):
