@@ -30,6 +30,7 @@ from spx_research.epistemics.types import (
     Delivery,
     HarnessError,
     MenuChoice,
+    aware_check,
 )
 
 
@@ -44,8 +45,7 @@ def digest(value: Any) -> str:
 
 
 def aware(t: datetime) -> None:
-    if t.tzinfo is None or t.utcoffset() is None:
-        raise HarnessError("NAIVE_TIME")
+    aware_check(t)
 
 
 class Harness:
@@ -127,6 +127,11 @@ class Harness:
         deliveries: Sequence[Delivery],
         ctx: Context,
         menu: Sequence[MenuChoice],
+        assessments: Sequence[Any] = (),
+        unknowns: Sequence[str] = (
+            "UNKNOWN_FUTURE_POLICY_PATH",
+            "UNKNOWN_FUTURE_PRICE_PATH",
+        ),
     ) -> Compiled:
         aware(ctx.as_of)
         if ctx.actor_role not in ACTIONS:
@@ -199,6 +204,22 @@ class Harness:
             )
         if not public_menu:
             raise HarnessError("EMPTY_ACTION_MENU")
+        public_assessments = []
+        for rec in assessments:
+            premise_tokens = [
+                self.token(ctx.alias_namespace, "ev", aid) for aid in rec.premise_atom_ids
+            ]
+            public_assessments.append(
+                {
+                    "topic": rec.topic,
+                    "assessment": rec.assessment,
+                    "confidence_label": rec.confidence_label,
+                    "premise_tokens": premise_tokens,
+                }
+            )
+        for u in unknowns:
+            if u not in UNKNOWNS:
+                raise HarnessError("UNAPPROVED_TEXT")
         packet = {
             "schema_version": "2.0",
             "actor_role": ctx.actor_role,
@@ -219,8 +240,8 @@ class Harness:
                 "minute_from_open": ctx.minute_from_open,
             },
             "premises": premises,
-            "assessments": [],
-            "unknowns": ["UNKNOWN_FUTURE_POLICY_PATH", "UNKNOWN_FUTURE_PRICE_PATH"],
+            "assessments": public_assessments,
+            "unknowns": sorted(set(unknowns)),
             "action_menu": public_menu,
         }
         packet["packet_token"] = "pkt_" + digest(packet)[:24]

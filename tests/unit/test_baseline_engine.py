@@ -327,6 +327,58 @@ def test_run_is_deterministic(dataset: tuple[Archive, Any]) -> None:
     assert event_log_digest(r1.events) == event_log_digest(r2.events)
 
 
+def test_future_suffix_does_not_change_prefix(
+    dataset: tuple[Archive, Any],
+    tmp_path: Any,
+) -> None:
+    """TK12 at the application layer: mutate everything after a cutoff —
+    post-cutoff sessions, later Greeks vintages, settlements, macro — and the
+    engine's prefix event log must remain byte-identical."""
+    import shutil
+    from datetime import UTC, datetime
+
+    import polars as pl
+
+    archive_a, cal = dataset
+    cutoff = date(2024, 1, 3)
+    cutoff_ts = datetime(2024, 1, 4, 0, 0, tzinfo=UTC)
+
+    root_b = tmp_path / "dsB"
+    shutil.copytree(archive_a.root, root_b)
+    for qf in (root_b / "quotes").glob("session=*.parquet"):
+        day = date.fromisoformat(qf.stem.split("=")[1])
+        if day > cutoff:
+            df = pl.read_parquet(qf)
+            df.with_columns(
+                (pl.col("bid_points") * 2).alias("bid_points"),
+                (pl.col("ask_points") * 2).alias("ask_points"),
+            ).write_parquet(qf)
+    gp = root_b / "meta" / "greeks.parquet"
+    pl.read_parquet(gp).with_columns(
+        pl.when(pl.col("asof_utc") > cutoff_ts)
+        .then(pl.col("delta") * 0.5)
+        .otherwise(pl.col("delta"))
+        .alias("delta")
+    ).write_parquet(gp)
+    sp = root_b / "meta" / "settlements.parquet"
+    pl.read_parquet(sp).with_columns(
+        (pl.col("value_index_points") * 1.1).alias("value_index_points")
+    ).write_parquet(sp)
+    mp = root_b / "macro" / "vintages.parquet"
+    mdf = pl.read_parquet(mp)
+    if "value" in mdf.columns:
+        mdf.with_columns(
+            pl.when(pl.col("simulated_available_at_utc") > cutoff_ts)
+            .then(pl.col("value") + "-MUT")
+            .otherwise(pl.col("value"))
+            .alias("value")
+        ).write_parquet(mp)
+
+    r_a = _engine(archive_a, cal).run(START, cutoff)
+    r_b = _engine(Archive(root_b), cal).run(START, cutoff)
+    assert event_log_digest(r_a.events) == event_log_digest(r_b.events)
+
+
 def test_reservation_lifecycle_visible_in_events(
     dataset: tuple[Archive, Any],
 ) -> None:

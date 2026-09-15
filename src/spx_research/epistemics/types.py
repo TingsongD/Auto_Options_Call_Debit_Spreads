@@ -16,6 +16,12 @@ class HarnessError(ValueError):
     """Fixed error code; never echo untrusted leaked prose into retry context."""
 
 
+def aware_check(t: datetime) -> datetime:
+    if t.tzinfo is None or t.utcoffset() is None:
+        raise HarnessError("NAIVE_TIME")
+    return t
+
+
 # Assertion kinds distinguish realized observations from schedules, forecasts,
 # derivations and approved rules (TKH spec §3.1).
 KINDS = {"OBSERVATION", "ANNOUNCEMENT", "SCHEDULE", "SOURCE_FORECAST", "DERIVED", "APPROVED_RULE"}
