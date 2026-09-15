@@ -397,3 +397,125 @@ def test_reservation_lifecycle_visible_in_events(
             if ev.type == "RESERVATION_STATUS" and ev.payload["reservation_id"] == rid
         ]
         assert "FILLED" in statuses or rid in released
+
+
+def _engine_with(archive: Archive, cal: Any, **profile_overrides: Any) -> Engine:
+    """Engine over the smoke dataset with a fully-hold policy (never exits)."""
+    import copy
+
+    from spx_research.persistence.events import InMemoryEventStore
+
+    d = copy.deepcopy(_profile_dict())
+    for section, kv in profile_overrides.items():
+        d[section].update(kv)
+    profile = Profile.model_validate(d)
+    hold = MechanicalPolicy(
+        profit_trigger=Decimal("999"),
+        loss_trigger=Decimal("-999"),
+        loss_activation_days=9999,
+        min_entry_credit_fraction=Decimal("0"),
+    )
+    return Engine(profile, cal, archive, InMemoryEventStore(), lambda _r: hold)
+
+
+def test_held_to_expiry_settles(dataset: tuple[Archive, Any]) -> None:
+    """T36/B1: a position still open on expiry day must settle when the PM
+    value publishes (close+30m) — not strand OPEN with reserve encumbered."""
+    archive, cal = dataset
+    result = _engine_with(archive, cal).run(START, END)
+    opened = [e for e in result.events if e.type == "POSITION_OPENED"]
+    assert opened, "fixture should open at least one position"
+    settled = {
+        e.payload["position_id"]
+        for e in result.events
+        if e.type == "POSITION_SETTLED"
+    }
+    for e in opened:
+        pid = e.payload["position"]["position_id"]
+        assert pid in settled, f"{pid} never settled"
+    st = result.final_state
+    assert not st.open_positions()
+    assert st.account.reserved == 0
+    gaps = [
+        e
+        for e in result.events
+        if e.type == "DATA_GAP" and e.payload.get("kind") == "settlement_unavailable"
+    ]
+    # Expiry-day gaps may occur intraday (value not yet published) but every
+    # position must eventually settle — no permanent stranding.
+    stranded = {g.payload["position_id"] for g in gaps} - settled
+    assert not stranded
+
+
+def test_close_fill_uses_closing_fee(dataset: tuple[Archive, Any]) -> None:
+    """H2: CLOSE fills must book closing_fee_per_leg_usd, not the opening fee."""
+    archive, cal = dataset
+    engine = _engine_with(
+        archive,
+        cal,
+        exit_policy={
+            "profit_review_band": [Decimal("0.3"), Decimal("0.4")],
+            "loss_review_band": [Decimal("0.2"), Decimal("0.3")],
+            "loss_activation_days_held": 25,
+        },
+        execution={
+            "opening_fee_per_leg_usd": Decimal("1"),
+            "closing_fee_per_leg_usd": Decimal("3"),
+        },
+    )
+    # restore a normal-profit policy so closes actually happen
+    from spx_research.persistence.events import InMemoryEventStore
+    import copy
+
+    d = copy.deepcopy(_profile_dict())
+    d["execution"] = {
+        "opening_fee_per_leg_usd": Decimal("1"),
+        "closing_fee_per_leg_usd": Decimal("3"),
+    }
+    profile = Profile.model_validate(d)
+    mech = MechanicalPolicy(
+        profit_trigger=Decimal("0.35"),
+        loss_trigger=Decimal("-0.25"),
+        loss_activation_days=25,
+        min_entry_credit_fraction=Decimal("0"),
+    )
+    engine = Engine(profile, cal, archive, InMemoryEventStore(), lambda _r: mech)
+    result = engine.run(START, END)
+    order_intent = {
+        e.payload["order_id"]: e.payload["intent"]
+        for e in result.events
+        if e.type == "ORDER_SUBMITTED"
+    }
+    close_fills = [
+        e
+        for e in result.events
+        if e.type == "ORDER_RESOLVED"
+        and e.payload.get("status") == "FILLED"
+        and order_intent.get(e.payload["order_id"]) == "CLOSE"
+    ]
+    assert close_fills, "fixture should produce at least one close fill"
+    for e in close_fills:
+        assert e.payload["fees_usd"] == "6.00"  # 2 legs x $3 closing fee
+
+
+def test_aggregate_reserve_cap_rejects_whole_allocation(
+    dataset: tuple[Archive, Any],
+) -> None:
+    """H3: committed + new must respect the aggregate cap; over-cap is a
+    Rejection (DECISION_REJECTED), never a crash."""
+    archive, cal = dataset
+    engine = _engine_with(
+        archive,
+        cal,
+        portfolio={
+            "max_aggregate_committed_risk_usd": Decimal("2600"),  # < 2 reserves
+        },
+    )
+    result = engine.run(START, END)
+    rejected = [
+        e for e in result.events
+        if e.type == "DECISION_REJECTED" and e.payload.get("code") == "RESERVE_EXCEEDS_RISK_LIMIT"
+    ]
+    assert rejected, "over-cap allocation should be rejected, not crash"
+    held = [e for e in result.events if e.type == "RESERVATION_HELD"]
+    assert len(held) <= 1  # at most one reserve fits under the cap

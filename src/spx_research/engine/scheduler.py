@@ -164,30 +164,42 @@ class Engine:
                 self._manager_due = False
             if t in grid:
                 self._spread_reviews(sess, t, offset)
+        # PM-settled positions: values publish after the close (synthetic:
+        # close+30m). One post-close pass books same-day settlement; if the
+        # value is still absent the per-minute check retries next session.
+        self._settle_due(sess.day, sess.close_utc() + timedelta(minutes=60))
         return last_t
 
     # -- phases ------------------------------------------------------------
 
     def _settle_due(self, day: date, t: datetime) -> None:
+        """Settle positions whose expiry has passed and whose PM value is now
+        available. Runs per-minute during the session, once post-close on the
+        expiry day itself, and keeps retrying on later sessions so a
+        late-published value still settles (T36)."""
         assert self.profile.execution is not None
         for pos in sorted(self.state.open_positions(), key=lambda p: p.position_id):
-            if pos.spread.expiration_local_date != day:
-                continue
-            st = self.archive.settlement_for(day)
+            expiry = pos.spread.expiration_local_date
+            if expiry > day:
+                continue  # not yet expiring
+            st = self.archive.settlement_for(expiry)
             if (
                 st is None
                 or st["simulated_available_at_utc"] > t
                 or st.get("value_index_points") is None
             ):
-                self._emit(
-                    t,
-                    "SETTLEMENT",
-                    "DATA_GAP",
-                    {
-                        "position_id": pos.position_id,
-                        "kind": "settlement_unavailable",
-                    },
-                )
+                if expiry == day:
+                    # Report the gap on the expiry day only; later-session
+                    # retries stay quiet to avoid DATA_GAP spam.
+                    self._emit(
+                        t,
+                        "SETTLEMENT",
+                        "DATA_GAP",
+                        {
+                            "position_id": pos.position_id,
+                            "kind": "settlement_unavailable",
+                        },
+                    )
                 continue
             settle_value = Decimal(str(st["value_index_points"]))
             liability = expiration_liability_points(pos.spread, settle_value)
@@ -211,10 +223,15 @@ class Engine:
 
     def _resolve_orders(self, t: datetime) -> None:
         assert self.profile.execution is not None
-        fee_leg = self.profile.execution.opening_fee_per_leg_usd or Decimal(0)
+        ex = self.profile.execution
         for order in sorted(self.state.orders.values(), key=lambda o: o.order_id):
             if order.status is not OrderStatus.PENDING:
                 continue
+            fee_leg = (
+                ex.closing_fee_per_leg_usd
+                if order.intent is OrderIntent.CLOSE
+                else ex.opening_fee_per_leg_usd
+            ) or Decimal(0)
             sq_row = self.archive.quote_at(order.spread.short.contract_id, t)
             lq_row = self.archive.quote_at(order.spread.long.contract_id, t)
             short_q = _quote_from_row(sq_row) if sq_row else None
@@ -387,6 +404,7 @@ class Engine:
         try:
             proposal = self.policy_provider("MANAGER").decide(ctx)
             validate_manager_proposal(ctx, proposal)
+            self._check_manager_capacity(proposal, t)
         except PolicyError as e:
             self._emit(t, "DECISION", "BARRIER_PAUSED", {"actor_id": "manager-1", "code": e.code})
             return
@@ -418,19 +436,43 @@ class Engine:
         )
         self._apply_manager(t, proposal)
 
+    def _reservation_reserve_usd(self, t: datetime) -> Decimal:
+        """Full-width encumbrance for any candidate using the real contract
+        multiplier of visible contracts (H3) — never a hardcoded 100x."""
+        from spx_research.engine.accounting import reserve_required_usd
+
+        assert self.profile.universe is not None and self.profile.portfolio is not None
+        max_width = max(self.profile.universe.spread_widths_index_points)
+        buffer = self.profile.portfolio.reservation_buffer_usd or Decimal(0)
+        mult = max(
+            (int(c["multiplier"]) for c in self.archive.contracts_visible_at(t)),
+            default=100,
+        )
+        return reserve_required_usd(max_width, mult, buffer)
+
+    def _check_manager_capacity(self, p: Proposal, t: datetime) -> None:
+        """Validate an ALLOCATE against risk caps before it is committed —
+        over-cap is a policy Rejection, not a crash (H3)."""
+        if p.kind != "ALLOCATE" or not p.allocation:
+            return
+        assert self.profile.portfolio is not None
+        reserve = self._reservation_reserve_usd(t)
+        n_new = sum(p.allocation.values())
+        per_spread = self.profile.portfolio.max_per_spread_initial_risk_usd
+        aggregate = self.profile.portfolio.max_aggregate_committed_risk_usd
+        if per_spread is not None and reserve > per_spread:
+            raise Rejection("RESERVE_EXCEEDS_RISK_LIMIT")
+        if (
+            aggregate is not None
+            and self.state.account.reserved + reserve * n_new > aggregate
+        ):
+            raise Rejection("RESERVE_EXCEEDS_RISK_LIMIT")
+
     def _apply_manager(self, t: datetime, p: Proposal) -> None:
         prof = self.profile
         assert prof.portfolio is not None and prof.universe is not None
         if p.kind == "ALLOCATE" and p.allocation:
-            max_width = max(prof.universe.spread_widths_index_points)
-            buffer = prof.portfolio.reservation_buffer_usd or Decimal(0)
-            reserve = usd(max_width * 100 + buffer)  # full width for any candidate
-            per_spread = prof.portfolio.max_per_spread_initial_risk_usd
-            aggregate = prof.portfolio.max_aggregate_committed_risk_usd
-            if (per_spread is not None and reserve > per_spread) or (
-                aggregate is not None and reserve > aggregate
-            ):
-                raise DomainError("RESERVE_EXCEEDS_RISK_LIMIT")
+            reserve = self._reservation_reserve_usd(t)
             for direction_name in sorted(p.allocation):
                 direction = (
                     Direction.BULL_PUT_CREDIT
