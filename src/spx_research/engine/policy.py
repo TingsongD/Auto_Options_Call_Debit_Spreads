@@ -107,6 +107,14 @@ class Policy(Protocol):
     def decide(self, ctx: DecisionContext) -> Proposal: ...
 
 
+class PolicyError(ValueError):
+    """Decision barrier could not be satisfied — caller pauses, not invents."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
 @dataclass
 class Rejection(Exception):
     code: str

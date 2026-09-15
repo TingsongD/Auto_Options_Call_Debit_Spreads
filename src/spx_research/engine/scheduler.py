@@ -35,6 +35,7 @@ from spx_research.engine.policy import (
     LimitTemplate,
     ManagerView,
     Policy,
+    PolicyError,
     Proposal,
     Rejection,
     SpreadView,
@@ -373,9 +374,12 @@ class Engine:
             minute_from_open=offset,
             manager_view=view,
         )
-        proposal = self.policy_provider("MANAGER").decide(ctx)
         try:
+            proposal = self.policy_provider("MANAGER").decide(ctx)
             validate_manager_proposal(ctx, proposal)
+        except PolicyError as e:
+            self._emit(t, "DECISION", "BARRIER_PAUSED", {"actor_id": "manager-1", "code": e.code})
+            return
         except Rejection as e:
             self.decisions.append(
                 {
@@ -488,9 +492,14 @@ class Engine:
                 minute_from_open=offset,
                 spread_view=view,
             )
-            proposal = self.policy_provider("SPREAD").decide(ctx)
             try:
+                proposal = self.policy_provider("SPREAD").decide(ctx)
                 validate_spread_proposal(ctx, proposal)
+            except PolicyError as e:
+                self._emit(
+                    t, "DECISION", "BARRIER_PAUSED", {"actor_id": agent.agent_id, "code": e.code}
+                )
+                continue
             except Rejection as e:
                 self._emit(
                     t, "DECISION", "DECISION_REJECTED", {"actor_id": agent.agent_id, "code": e.code}
