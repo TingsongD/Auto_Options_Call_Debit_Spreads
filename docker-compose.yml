@@ -1,0 +1,21 @@
+# Development PostgreSQL for the research platform.
+# brew/system Postgres on 5432 is left untouched; this instance uses 5433.
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: spx_research
+      POSTGRES_USER: spx_dev
+      POSTGRES_PASSWORD: spx_dev_local_only
+    ports:
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - spx_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U spx_dev -d spx_research"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+
+volumes:
+  spx_pgdata:
