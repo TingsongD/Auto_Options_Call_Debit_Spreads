@@ -214,3 +214,66 @@ def _parse_dt(v: str) -> datetime:
     from datetime import datetime
 
     return datetime.fromisoformat(v)
+
+
+@app.command()
+def leakage_eval(
+    run_dir: Annotated[Path, typer.Argument(help="run output directory with events.jsonl")],
+    control_dir: Annotated[
+        Path | None, typer.Option(help="second run dir for invariance comparison")
+    ] = None,
+    tape: Annotated[Path | None, typer.Option(help="decision tape JSONL")] = None,
+    initial_cash: Annotated[str, typer.Option()] = "10000",
+    out: Annotated[Path | None, typer.Option(help="report output path")] = None,
+) -> None:
+    """Fixed-classification leakage evaluation for a run (M6)."""
+    from spx_research.research.leakage import compare_runs, evaluate_run
+
+    report = evaluate_run(run_dir, tape_path=tape, initial_cash=Decimal(initial_cash))
+    if control_dir is not None:
+        report["invariance"] = compare_runs(run_dir, control_dir)
+    out_path = out or (run_dir / "leakage_report.json")
+    out_path.write_text(json.dumps(report, indent=2, sort_keys=True))
+    ok = report["checks"]["hash_chain_ok"] and report["checks"]["replay_ok"]
+    n_egress = len(report["checks"]["egress_violations"])
+    typer.secho(
+        f"{'OK' if ok and not n_egress else 'FAIL'}: hash_chain={report['checks']['hash_chain_ok']}"
+        f" replay={report['checks']['replay_ok']} egress_violations={n_egress}"
+        f" -> {out_path}",
+        fg=typer.colors.GREEN if ok and not n_egress else typer.colors.RED,
+    )
+    if not (ok and not n_egress):
+        raise typer.Exit(1)
+
+
+@app.command()
+def register_run(
+    run_dir: Annotated[Path, typer.Argument(help="run output directory")],
+    registry: Annotated[Path, typer.Option(help="registry JSONL path")],
+    profile: Annotated[Path | None, typer.Option(help="profile YAML used for the run")] = None,
+    tape: Annotated[Path | None, typer.Option(help="decision tape JSONL")] = None,
+    model_id: Annotated[str | None, typer.Option()] = None,
+) -> None:
+    """Register a run's lineage in the experiment registry (M6)."""
+    import subprocess
+
+    from spx_research.research.experiments import ExperimentRegistry
+
+    manifest_path = run_dir / "run_manifest.json"
+    manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
+    import contextlib
+
+    code_version = None
+    with contextlib.suppress(Exception):
+        code_version = subprocess.run(
+            ["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True
+        ).stdout.strip()
+    rec = ExperimentRegistry(registry).register(
+        manifest.get("run_id", run_dir.name),
+        profile_path=profile,
+        dataset_manifest_id=manifest.get("dataset_manifest_id"),
+        model_id=model_id,
+        tape_path=tape,
+        code_version=code_version,
+    )
+    typer.secho(f"OK: {rec.experiment_id} (run {rec.run_id}) -> {registry}", fg=typer.colors.GREEN)

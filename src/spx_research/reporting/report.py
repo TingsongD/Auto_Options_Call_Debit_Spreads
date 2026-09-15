@@ -36,6 +36,11 @@ def run_manifest(
         "event_log_sha256": event_log_digest(result.events),
         "decision_count": len(result.decisions),
         "final_cash_usd": str(result.final_state.account.cash),
+        "initial_cash_usd": (
+            str(profile.portfolio.initial_capital_usd)
+            if profile.portfolio and profile.portfolio.initial_capital_usd is not None
+            else None
+        ),
         "open_positions": len(result.final_state.open_positions()),
         "study_label": (profile.harness.study_label if profile.harness else None),
     }

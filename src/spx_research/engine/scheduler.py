@@ -127,7 +127,17 @@ class Engine:
         p = self.profile
         first = self.calendar.session_days(start, end)
         boot = first[0].open_utc() if first else datetime.combine(start, datetime.min.time())
-        self._emit(boot, "RUN", "RUN_STARTED", {"profile_id": p.profile_id, "mode": p.mode})
+        assert p.portfolio is not None
+        self._emit(
+            boot,
+            "RUN",
+            "RUN_STARTED",
+            {
+                "profile_id": p.profile_id,
+                "mode": p.mode,
+                "initial_cash_usd": str(p.portfolio.initial_capital_usd),
+            },
+        )
         last_t = boot
         for sess in self.calendar.session_days(start, end):
             last_t = self._session(sess)

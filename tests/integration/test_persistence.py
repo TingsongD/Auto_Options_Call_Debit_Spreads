@@ -54,7 +54,10 @@ def test_event_append_and_tip(pg):
     assert store.tip(rid)[0] == 2
     evs = store.events(rid)
     assert [e.seq for e in evs] == [1, 2]
-    assert evs[1].previous_hash == evs[0].payload_hash  # hash chain
+    import hashlib
+
+    expected = hashlib.sha256((evs[0].payload_hash + str(evs[0].seq)).encode()).hexdigest()[:24]
+    assert evs[1].previous_hash == expected  # hash chain matches in-memory rule
 
 
 def test_single_writer_cas(pg):

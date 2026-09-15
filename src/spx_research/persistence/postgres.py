@@ -20,6 +20,13 @@ from spx_research.persistence import schema as S
 from spx_research.persistence.events import LedgerError, payload_hash
 
 
+def _chain_hash(payload: str, seq: int) -> str:
+    """Same chaining rule as InMemoryEventStore.tip."""
+    import hashlib
+
+    return hashlib.sha256((payload + str(seq)).encode()).hexdigest()[:24]
+
+
 def _scope(conn: sa.engine.Connection, run_id: str) -> None:
     """Set the RLS run scope for this transaction (no-op for table owners)."""
     conn.execute(sa.text("SELECT set_config('app.run_id', :r, true)"), {"r": run_id})
@@ -50,7 +57,10 @@ class PostgresEventStore:
                 .order_by(S.events.c.seq.desc())
                 .limit(1)
             ).first()
-            seq, prev_hash = (row.seq, row.payload_hash) if row else (0, "genesis")
+            if row:
+                seq, prev_hash = row.seq, _chain_hash(row.payload_hash, row.seq)
+            else:
+                seq, prev_hash = 0, "genesis"
             if expected_seq != seq:
                 raise LedgerError("SEQUENCE_MISMATCH")
             e = event.with_hashes(payload_hash(event.payload), prev_hash)
@@ -123,7 +133,9 @@ class PostgresEventStore:
                 .order_by(S.events.c.seq.desc())
                 .limit(1)
             ).first()
-        return (row.seq, row.payload_hash) if row else (0, "genesis")
+        if not row:
+            return 0, "genesis"
+        return row.seq, _chain_hash(row.payload_hash, row.seq)
 
 
 class PostgresObservationLedger:
