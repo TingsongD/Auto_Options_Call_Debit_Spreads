@@ -65,7 +65,7 @@ class InMemoryObservationLedger:
         self._deliveries: list[Delivery] = []
         self._assessments: list[AssessmentRecord] = []
         self._incidents: list[Incident] = []
-        self._incident_seq = 0
+        self._incident_seq: dict[str, int] = {}
 
     def put_atom(self, atom: Atom) -> None:
         for t in (atom.published_at, atom.available_at, atom.subject_at):
@@ -102,16 +102,20 @@ class InMemoryObservationLedger:
         self._assessments.append(rec)
 
     def assessments(self, run_id: str, branch_id: str, actor_id: str) -> list[AssessmentRecord]:
-        # run/branch scoping is enforced at write time by the caller context;
-        # assessments are actor-private records keyed to that actor's decisions.
-        return [r for r in self._assessments if r.actor_id == actor_id]
+        # Same scoping as PostgresObservationLedger: run + branch + actor.
+        return [
+            r
+            for r in self._assessments
+            if (r.run_id, r.branch_id, r.actor_id) == (run_id, branch_id, actor_id)
+        ]
 
     def quarantine(self, incident: Incident) -> None:
-        self._incident_seq += 1
+        self._incident_seq[incident.run_id] = self._incident_seq.get(incident.run_id, 0) + 1
         self._incidents.append(incident)
 
     def next_incident_id(self, run_id: str) -> str:
-        return f"inc-{run_id}-{self._incident_seq + 1:04d}"
+        # Per-run sequence, same shape as PostgresObservationLedger.
+        return f"inc-{run_id}-{self._incident_seq.get(run_id, 0) + 1:04d}"
 
     def incidents(self, run_id: str) -> list[Incident]:
         return [i for i in self._incidents if i.run_id == run_id]

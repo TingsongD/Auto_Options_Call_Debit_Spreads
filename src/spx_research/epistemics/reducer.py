@@ -50,7 +50,11 @@ def reduce_belief(
     observed.sort(key=lambda a: a.atom_id)
     assessments = tuple(
         sorted(
-            ledger.assessments(ctx.run_id, ctx.branch_id, ctx.actor_id),
+            (
+                r
+                for r in ledger.assessments(ctx.run_id, ctx.branch_id, ctx.actor_id)
+                if r.accepted_at <= ctx.as_of
+            ),
             key=lambda r: (r.accepted_at, r.topic),
         )
     )

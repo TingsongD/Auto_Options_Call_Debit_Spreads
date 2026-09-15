@@ -425,11 +425,7 @@ def test_held_to_expiry_settles(dataset: tuple[Archive, Any]) -> None:
     result = _engine_with(archive, cal).run(START, END)
     opened = [e for e in result.events if e.type == "POSITION_OPENED"]
     assert opened, "fixture should open at least one position"
-    settled = {
-        e.payload["position_id"]
-        for e in result.events
-        if e.type == "POSITION_SETTLED"
-    }
+    settled = {e.payload["position_id"] for e in result.events if e.type == "POSITION_SETTLED"}
     for e in opened:
         pid = e.payload["position"]["position_id"]
         assert pid in settled, f"{pid} never settled"
@@ -464,8 +460,9 @@ def test_close_fill_uses_closing_fee(dataset: tuple[Archive, Any]) -> None:
         },
     )
     # restore a normal-profit policy so closes actually happen
-    from spx_research.persistence.events import InMemoryEventStore
     import copy
+
+    from spx_research.persistence.events import InMemoryEventStore
 
     d = copy.deepcopy(_profile_dict())
     d["execution"] = {
@@ -513,7 +510,8 @@ def test_aggregate_reserve_cap_rejects_whole_allocation(
     )
     result = engine.run(START, END)
     rejected = [
-        e for e in result.events
+        e
+        for e in result.events
         if e.type == "DECISION_REJECTED" and e.payload.get("code") == "RESERVE_EXCEEDS_RISK_LIMIT"
     ]
     assert rejected, "over-cap allocation should be rejected, not crash"

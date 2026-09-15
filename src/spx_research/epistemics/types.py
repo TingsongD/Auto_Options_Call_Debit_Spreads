@@ -42,6 +42,8 @@ VOCAB: dict[str, tuple[str, frozenset[str] | None]] = {
     "direction_target": ("bullish_per_bearish", None),
     "advisory_rule": ("policy", frozenset({"DISCRETIONARY", "MANDATORY", "UNKNOWN"})),
     "direction_mandate": ("policy", frozenset({"BULL_PUT_CREDIT", "BEAR_CALL_CREDIT", "UNKNOWN"})),
+    "DGS10": ("percent", None),
+    "FED_TARGET_UPPER_BPS": ("basis_points", None),
 }
 
 CONFIDENCE = {"LOW", "MEDIUM", "HIGH", "UNASSESSABLE"}

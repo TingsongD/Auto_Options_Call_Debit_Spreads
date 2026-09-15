@@ -15,7 +15,7 @@ from spx_research.engine.policy import ManagerView, SpreadView
 from spx_research.epistemics.egress import egress_check
 from spx_research.epistemics.harness import Harness, digest
 from spx_research.epistemics.store import ObservationLedger
-from spx_research.epistemics.types import Atom, Compiled, Context, MenuChoice
+from spx_research.epistemics.types import VOCAB, Atom, Compiled, Context, MenuChoice
 
 
 def atom_id_for(metric: str, value: str, unit: str, kind: str, available_at: datetime) -> str:
@@ -127,7 +127,22 @@ def manager_atoms(view: ManagerView, as_of: datetime) -> list[Atom]:
         ),
     ]
     for fact in view.macro_facts:
-        out.append(_atom(fact["metric"], str(fact["value"]), as_of))
+        unit, _allowed = VOCAB[fact["metric"]]
+        aid = atom_id_for(
+            fact["metric"], str(fact["value"]), unit, "OBSERVATION", fact["available_at"]
+        )
+        out.append(
+            Atom(
+                aid,
+                fact["metric"],
+                str(fact["value"]),
+                unit,
+                "OBSERVATION",
+                fact["published_at"],
+                fact["available_at"],
+                fact["subject_at"],
+            )
+        )
     return out
 
 

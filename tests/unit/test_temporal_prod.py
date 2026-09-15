@@ -256,6 +256,8 @@ class TestAssessmentAndQuarantine:
             tuple(comp.premise_map[p].atom_id for p in proposal["premise_tokens"]),
             ctx.as_of,
             proposal["decision_token"],
+            run_id=ctx.run_id,
+            branch_id=ctx.branch_id,
         )
         led.put_assessment(rec)
         # next packet carries the assessment (bounded memory)
@@ -285,3 +287,197 @@ class TestAssessmentAndQuarantine:
         retry_context = {"last_error": code}
         assert "act_forged" not in str(retry_context)
         assert digest(comp.public)  # packet still well-formed
+
+
+class TestHarnessSemantics:
+    """Wave 3: prefix-only assessments (H1), store parity, packet schema (H5),
+    macro vintages (H6)."""
+
+    def test_assessments_bounded_by_as_of(self) -> None:
+        # An assessment accepted *after* the barrier's as_of must not enter
+        # the packet — replaying an earlier barrier must not see later belief.
+        led = InMemoryObservationLedger()
+        h = Harness(KEY)
+        a = _obs("policy_rate_bps", "525", T0 - timedelta(hours=2))
+        led.put_atom(a)
+        led.deliver("run-1", "main", "agent-1", a.atom_id, T0 - timedelta(hours=2))
+        for va in spread_atoms(
+            __import__("spx_research.engine.policy", fromlist=["SpreadView"]).SpreadView(
+                _mk_agent(), None, None, None, 0, (), (), ()
+            ),
+            T0,
+        ):
+            led.put_atom(va)
+            led.deliver("run-1", "main", "agent-1", va.atom_id, T0)
+        led.put_assessment(
+            AssessmentRecord(
+                "agent-1",
+                "RATE_OUTLOOK",
+                "UNCERTAIN",
+                "LOW",
+                (a.atom_id,),
+                T0 + timedelta(hours=1),  # accepted after the packet's as_of
+                "dt-future",
+                run_id="run-1",
+                branch_id="main",
+            )
+        )
+        ctx = _ctx("agent-1")
+        comp = compile_for_actor(led, h, ctx, _menu(led, ctx))
+        assert comp.public["assessments"] == []
+        # After acceptance time the same record is visible (view atoms are
+        # re-emitted and re-delivered at the later barrier's as_of).
+        ctx2 = _ctx("agent-1", as_of=T0 + timedelta(hours=2))
+        for va in spread_atoms(
+            __import__("spx_research.engine.policy", fromlist=["SpreadView"]).SpreadView(
+                _mk_agent(), None, None, None, 0, (), (), ()
+            ),
+            ctx2.as_of,
+        ):
+            led.put_atom(va)
+            led.deliver("run-1", "main", "agent-1", va.atom_id, ctx2.as_of)
+        comp2 = compile_for_actor(led, h, ctx2, _menu(led, ctx2))
+        assert len(comp2.public["assessments"]) == 1
+
+    def test_assessments_scoped_to_run(self) -> None:
+        # InMemory store must scope run+branch+actor like Postgres — a record
+        # from run-2 must not leak into run-1's packet.
+        led = InMemoryObservationLedger()
+        h = Harness(KEY)
+        a = _obs("policy_rate_bps", "525", T0 - timedelta(hours=1))
+        led.put_atom(a)
+        led.deliver("run-1", "main", "agent-1", a.atom_id, T0 - timedelta(hours=1))
+        for va in spread_atoms(
+            __import__("spx_research.engine.policy", fromlist=["SpreadView"]).SpreadView(
+                _mk_agent(), None, None, None, 0, (), (), ()
+            ),
+            T0,
+        ):
+            led.put_atom(va)
+            led.deliver("run-1", "main", "agent-1", va.atom_id, T0)
+        led.put_assessment(
+            AssessmentRecord(
+                "agent-1",
+                "RATE_OUTLOOK",
+                "UNCERTAIN",
+                "LOW",
+                (a.atom_id,),
+                T0 - timedelta(minutes=30),
+                "dt-other-run",
+                run_id="run-2",
+                branch_id="main",
+            )
+        )
+        ctx = _ctx("agent-1")
+        comp = compile_for_actor(led, h, ctx, _menu(led, ctx))
+        assert comp.public["assessments"] == []
+
+    def test_incident_ids_are_per_run(self) -> None:
+        # Parity with PostgresObservationLedger: sequence resets per run so
+        # identical runs produce identical incident ids under either store.
+        led = InMemoryObservationLedger()
+        assert led.next_incident_id("run-1") == "inc-run-1-0001"
+        assert led.next_incident_id("run-2") == "inc-run-2-0001"
+
+    def test_generated_packet_validates_against_schema(self) -> None:
+        # Contract test: code-generated packets (not only spec examples) must
+        # satisfy the governing schema — including the per-assessment token.
+        jsonschema = pytest.importorskip("jsonschema")
+        from spx_research.contracts import load_schema
+
+        led = InMemoryObservationLedger()
+        h = Harness(KEY)
+        ctx = _ctx("agent-1")
+        atoms = spread_atoms(
+            __import__("spx_research.engine.policy", fromlist=["SpreadView"]).SpreadView(
+                _mk_agent(), None, None, None, 0, (), (), ()
+            ),
+            T0,
+        )
+        for a in atoms:
+            led.put_atom(a)
+            led.deliver("run-1", "main", "agent-1", a.atom_id, T0)
+        menu = _menu(led, ctx)
+        led.put_assessment(
+            AssessmentRecord(
+                "agent-1",
+                "RATE_OUTLOOK",
+                "UNCERTAIN",
+                "LOW",
+                (atoms[0].atom_id,),
+                T0 - timedelta(minutes=1),
+                "dt-prev",
+                run_id="run-1",
+                branch_id="main",
+            )
+        )
+        comp = compile_for_actor(led, h, ctx, menu)
+        jsonschema.validate(comp.public, load_schema("model_visible_packet"))
+        assert comp.public["assessments"][0]["token"].startswith("as_")
+
+    def test_macro_atoms_carry_real_vintages(self) -> None:
+        # manager_atoms must stamp macro atoms with their true published /
+        # available / subject times, not the barrier's as_of — vintage times
+        # are what the delivery gate checks.
+        from spx_research.engine.policy import ManagerView
+
+        published = T0 - timedelta(hours=1)
+        available = T0 - timedelta(minutes=30)
+        subject = T0 - timedelta(days=1)
+        view = ManagerView(
+            as_of_utc=T0,
+            active_bullish=0,
+            active_bearish=0,
+            reserved_bullish=0,
+            reserved_bearish=0,
+            capacity=3,
+            bullish_target=2,
+            bearish_target=1,
+            paused=False,
+            available_usd=Decimal("10000"),
+            reservations=(),
+            macro_facts=(
+                {
+                    "metric": "DGS10",
+                    "value": "4.274",
+                    "published_at": published,
+                    "available_at": available,
+                    "subject_at": subject,
+                },
+            ),
+        )
+        atoms = manager_atoms(view, T0)
+        macro = [a for a in atoms if a.metric == "DGS10"]
+        assert len(macro) == 1
+        a = macro[0]
+        assert a.available_at == available and a.published_at == published
+        assert a.subject_at == subject and a.unit == "percent"
+        # An atom whose availability is still in the future cannot be
+        # delivered — the ledger fails closed.
+        led = InMemoryObservationLedger()
+        late = ManagerView(
+            as_of_utc=T0,
+            active_bullish=0,
+            active_bearish=0,
+            reserved_bullish=0,
+            reserved_bearish=0,
+            capacity=3,
+            bullish_target=2,
+            bearish_target=1,
+            paused=False,
+            available_usd=Decimal("10000"),
+            reservations=(),
+            macro_facts=(
+                {
+                    "metric": "DGS10",
+                    "value": "4.300",
+                    "published_at": T0,
+                    "available_at": T0 + timedelta(hours=1),
+                    "subject_at": subject,
+                },
+            ),
+        )
+        late_atom = next(x for x in manager_atoms(late, T0) if x.metric == "DGS10")
+        led.put_atom(late_atom)
+        with pytest.raises(HarnessError, match="DELIVERY_BEFORE_AVAILABILITY"):
+            led.deliver("run-1", "main", "manager-1", late_atom.atom_id, T0)

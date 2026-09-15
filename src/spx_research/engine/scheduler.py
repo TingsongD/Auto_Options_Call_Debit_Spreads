@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -45,7 +45,7 @@ from spx_research.engine.policy import (
 from spx_research.engine.settlement import expiration_liability_points
 from spx_research.features.candidates import Candidate, build_candidates
 from spx_research.persistence.events import EventStore
-from spx_research.temporal.calendar import CalendarManifest, SessionDay
+from spx_research.temporal.calendar import NY, UTC_TZ, CalendarManifest, SessionDay
 
 
 @dataclass
@@ -367,6 +367,37 @@ class Engine:
 
     # -- decision phases ----------------------------------------------------
 
+    def _macro_facts(self, t: datetime) -> tuple[dict[str, Any], ...]:
+        """Available macro vintages, shaped for ``manager_atoms`` (H6).
+
+        ``FED_MEETING_SCHEDULE`` rows carry an absolute future date; that date
+        cannot cross the egress gate, so it is expressed relative to ``t`` via
+        the ``minutes_to_meeting`` metric instead.
+        """
+        facts: list[dict[str, Any]] = []
+        for r in self.archive.macro_visible_at(t):
+            subject = r["observation_period_end"]
+            if isinstance(subject, date) and not isinstance(subject, datetime):
+                subject = datetime.combine(subject, time.min, tzinfo=UTC_TZ)
+            metric = str(r["series_id"])
+            value = str(r["value"])
+            if metric == "FED_MEETING_SCHEDULE":
+                meeting_ts = datetime.combine(
+                    date.fromisoformat(value), time(14, 0), tzinfo=NY
+                ).astimezone(UTC_TZ)
+                metric = "minutes_to_meeting"
+                value = str(max(0, int((meeting_ts - t).total_seconds() // 60)))
+            facts.append(
+                {
+                    "metric": metric,
+                    "value": value,
+                    "published_at": r["public_release_at_utc"],
+                    "available_at": r["simulated_available_at_utc"],
+                    "subject_at": subject,
+                }
+            )
+        return tuple(facts)
+
     def _manager_review(self, t: datetime, sess: SessionDay, offset: int) -> None:
         p = self.profile
         assert p.portfolio is not None
@@ -390,6 +421,7 @@ class Engine:
                 for r in self.state.reservations.values()
                 if r.status is ReservationStatus.SEEKING_ENTRY
             ),
+            macro_facts=self._macro_facts(t),
         )
         ctx = DecisionContext(
             self.run_id,
@@ -462,10 +494,7 @@ class Engine:
         aggregate = self.profile.portfolio.max_aggregate_committed_risk_usd
         if per_spread is not None and reserve > per_spread:
             raise Rejection("RESERVE_EXCEEDS_RISK_LIMIT")
-        if (
-            aggregate is not None
-            and self.state.account.reserved + reserve * n_new > aggregate
-        ):
+        if aggregate is not None and self.state.account.reserved + reserve * n_new > aggregate:
             raise Rejection("RESERVE_EXCEEDS_RISK_LIMIT")
 
     def _apply_manager(self, t: datetime, p: Proposal) -> None:

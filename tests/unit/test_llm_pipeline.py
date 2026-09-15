@@ -275,3 +275,78 @@ def test_engine_with_llm_policy_end_to_end(tmp_path: Any) -> None:
     kinds = {e.payload["kind"] for e in result.events if e.type == "DECISION_MADE"}
     assert "ALLOCATE" in kinds  # manager allocated through the pipeline
     assert len(deps.tape) > 0  # every accepted decision was taped
+
+
+def test_engine_macro_vintages_reach_manager_only_after_availability(
+    tmp_path: Any,
+) -> None:
+    """H6 end-to-end: DGS10 (16:15 ET release) and the scheduled-meeting row
+    are delivered to manager-1 only once their availability has passed, and
+    the schedule's absolute future date crosses the boundary only as the
+    relative ``minutes_to_meeting`` metric."""
+    from datetime import UTC, date, datetime, timedelta
+
+    from spx_research.config import Profile
+    from spx_research.data.availability import Archive
+    from spx_research.data.synthetic import SyntheticSpec, generate
+    from spx_research.engine.scheduler import Engine
+    from spx_research.persistence.events import InMemoryEventStore
+    from spx_research.temporal.calendar import build_weekday_manifest
+    from tests.unit.test_baseline_engine import _profile_dict
+
+    start = date(2024, 1, 2)
+    end = date(2024, 1, 3)
+    cal = build_weekday_manifest("cal-llm", start, end + timedelta(days=60))
+    root = tmp_path / "ds"
+    generate(
+        root,
+        SyntheticSpec(
+            "llm-macro",
+            11,
+            start,
+            end,
+            expiries=(date(2024, 2, 16),),
+            strike_step=Decimal("25"),
+            strikes_each_side=24,
+        ),
+        cal,
+    )
+    profile = Profile.model_validate(_profile_dict())
+    deps = PolicyDeps(
+        harness=Harness(KEY),
+        ledger=InMemoryObservationLedger(),
+        gateway=MockGateway(),
+        tape=DecisionTape(tmp_path / "tape.jsonl"),
+        profile=profile,
+        max_retries=1,
+        model_id="mock-1",
+    )
+    engine = Engine(
+        profile,
+        cal,
+        Archive(root / "llm-macro"),
+        InMemoryEventStore(),
+        lambda _r: LLMPolicy(deps),
+        run_id="run-1",
+    )
+    engine.run(start, end)
+
+    deliveries = deps.ledger.deliveries("run-1", "main", "manager-1")
+    atoms = deps.ledger.atoms()
+    dgs = [(d, atoms[d.atom_id]) for d in deliveries if atoms[d.atom_id].metric == "DGS10"]
+    assert dgs, "manager never received a DGS10 atom"
+    for d, a in dgs:
+        # Delivered no earlier than the atom's own availability stamp…
+        assert d.delivered_at >= a.available_at
+        # …and no earlier than that day's 16:15 ET (21:15 UTC) release.
+        release = datetime(
+            d.delivered_at.year, d.delivered_at.month, d.delivered_at.day, 21, 15, tzinfo=UTC
+        )
+        assert d.delivered_at >= release or a.subject_at.date() < d.delivered_at.date()
+        # The released print is never a future date's value.
+        assert a.subject_at.date() <= d.delivered_at.date()
+    # The scheduled-meeting row surfaces only in relative form.
+    mins = [atoms[d.atom_id] for d in deliveries if atoms[d.atom_id].metric == "minutes_to_meeting"]
+    assert mins, "scheduled meeting never surfaced as minutes_to_meeting"
+    assert all(m.value.isdigit() for m in mins)
+    assert not any(atoms[d.atom_id].metric == "FED_MEETING_SCHEDULE" for d in deliveries)

@@ -211,6 +211,7 @@ class Harness:
             ]
             public_assessments.append(
                 {
+                    "token": self.token(ctx.alias_namespace, "as", rec.decision_token),
                     "topic": rec.topic,
                     "assessment": rec.assessment,
                     "confidence_label": rec.confidence_label,
