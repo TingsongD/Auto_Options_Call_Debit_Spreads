@@ -7,6 +7,10 @@ before implementing. `docs/DECISIONS.md` there lists owner approvals that remain
 open; nothing here may run against real data or real models until those gates
 clear.
 
+**Governance gate:** all 33 owner decisions in `docs/DECISION_REGISTER.md` are
+`_pending_` and the vendor data-rights probe (`docs/DATA_RIGHTS_PROBE.md`) is
+unchecked — this codebase is a tested scaffold, not an approved system.
+
 ## Layout
 
 `src/spx_research/` follows the spec's target decomposition: `domain`, `data`,

@@ -128,6 +128,9 @@ class ExitPolicy(Section):
     loss_activation_days_held: int = 25
     early_loss_notice_days_held: int = 20
     early_discretionary_exit_allowed: bool = True
+    # Reserved surface — parsed and validated but not consumed by the engine
+    # yet; they gate owner decisions D02/D05 in the decision register. The
+    # spec forbids hard stops by default, so nothing reads these today.
     mandatory_loss_stop_enabled: bool = False
     mandatory_exit_before_dte: int | None = None
 
@@ -197,6 +200,9 @@ class Models(Section):
 
 
 class Quality(Section):
+    """Data-quality policy knobs. Reserved surface: parsed and validated but
+    not yet consumed by the engine — they land with the QA/ingest commands."""
+
     missing_open_position_quote: str = "pause_validated_run"
     invalid_candidate_quote: str = "reject_candidate_and_report"
     coverage_outage: str = "pause_not_no_trade"

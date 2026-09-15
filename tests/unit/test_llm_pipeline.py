@@ -275,6 +275,9 @@ def test_engine_with_llm_policy_end_to_end(tmp_path: Any) -> None:
     kinds = {e.payload["kind"] for e in result.events if e.type == "DECISION_MADE"}
     assert "ALLOCATE" in kinds  # manager allocated through the pipeline
     assert len(deps.tape) > 0  # every accepted decision was taped
+    witnesses = [e for e in result.events if e.type == "DECISION_WITNESS"]
+    assert len(witnesses) == len([e for e in result.events if e.type == "DECISION_MADE"])
+    assert all(w.payload["status"] == "ACCEPTED" for w in witnesses)
 
 
 def test_engine_macro_vintages_reach_manager_only_after_availability(

@@ -69,13 +69,17 @@ def build_candidates(
     reserve_per_spread_usd: Decimal,
     max_risk_usd: Decimal | None,
     max_candidates: int,
+    target_dte: int = 45,
+    allowed_roots: tuple[str, ...] = (),
     version: str = "candidates-1",
 ) -> list[Candidate]:
     """Deterministic eligible shortlist for one direction at one decision time."""
     as_of = require_aware(as_of)
     right = Right.PUT if direction is Direction.BULL_PUT_CREDIT else Right.CALL
     contracts = [
-        c for c in (_contract(r) for r in archive.contracts_visible_at(as_of)) if c.right is right
+        c
+        for c in (_contract(r) for r in archive.contracts_visible_at(as_of))
+        if c.right is right and (not allowed_roots or c.root in allowed_roots)
     ]
     eligible: list[Candidate] = []
     for expiry in sorted({c.expiration_local_date for c in contracts}):
@@ -119,7 +123,7 @@ def build_candidates(
                 if max_loss > reserve_per_spread_usd:
                     continue  # cannot exceed the encumbered reserve
                 sort_key = (
-                    abs(dte - 45),  # prefer nearest 45 DTE
+                    abs(dte - target_dte),  # prefer nearest target DTE
                     -float(credit / w),  # then richer credit fraction
                     short_c.strike_points,
                     w,

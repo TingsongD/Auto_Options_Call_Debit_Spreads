@@ -8,6 +8,23 @@ on:
 jobs:
   check:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: spx_research
+          POSTGRES_USER: spx_dev
+          POSTGRES_PASSWORD: spx_dev_local_only
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U spx_dev -d spx_research"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      SPX_DB_DSN: postgresql+psycopg://spx_dev:spx_dev_local_only@127.0.0.1:5433/spx_research
+      SPX_TEST_DSN: postgresql+psycopg://spx_dev:spx_dev_local_only@127.0.0.1:5433/spx_research
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
@@ -16,4 +33,5 @@ jobs:
       - run: uv sync --frozen
       - run: uv run ruff check
       - run: uv run mypy src
+      - run: uv run spx-research migrate
       - run: uv run pytest -q

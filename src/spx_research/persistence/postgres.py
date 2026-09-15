@@ -102,6 +102,13 @@ class PostgresEventStore:
                         payload=ob["payload"],
                     )
                 )
+            if e.type == "RUN_ENDED":
+                # Terminal status: the event is committed in this txn, so the
+                # run row's status transitions atomically with the ledger.
+                conn.execute(
+                    sa.text("UPDATE runs SET status='COMPLETED' WHERE run_id=:r"),
+                    {"r": e.run_id},
+                )
             return e
 
     def events(self, run_id: str) -> list[Event]:

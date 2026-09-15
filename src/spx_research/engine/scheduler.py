@@ -121,6 +121,16 @@ class Engine:
         )
         fold(self.state, committed)
 
+    def _emit_witness(self, t: datetime, pol: Policy) -> None:
+        """Persist the validated decision witness (auditable proof object).
+
+        Only policies that run the harness pipeline expose ``last_witness``;
+        the mechanical policy leaves no witness.
+        """
+        witness = getattr(pol, "last_witness", None)
+        if witness:
+            self._emit(t, "DECISION", "DECISION_WITNESS", dict(witness))
+
     # -- public run loop --------------------------------------------------
 
     def run(self, start: date, end: date) -> RunResult:
@@ -375,7 +385,13 @@ class Engine:
         the ``minutes_to_meeting`` metric instead.
         """
         facts: list[dict[str, Any]] = []
+        require_pub = bool(
+            self.profile.macro
+            and self.profile.macro.publication_timestamp_required_for_intraday_use
+        )
         for r in self.archive.macro_visible_at(t):
+            if require_pub and r.get("public_release_at_utc") is None:
+                continue  # intraday use requires a real publication timestamp
             subject = r["observation_period_end"]
             if isinstance(subject, date) and not isinstance(subject, datetime):
                 subject = datetime.combine(subject, time.min, tzinfo=UTC_TZ)
@@ -434,7 +450,8 @@ class Engine:
             manager_view=view,
         )
         try:
-            proposal = self.policy_provider("MANAGER").decide(ctx)
+            pol = self.policy_provider("MANAGER")
+            proposal = pol.decide(ctx)
             validate_manager_proposal(ctx, proposal)
             self._check_manager_capacity(proposal, t)
         except PolicyError as e:
@@ -456,6 +473,7 @@ class Engine:
         self.decisions.append(
             {"actor": "manager-1", "at": t.isoformat(), "proposal": proposal.kind}
         )
+        self._emit_witness(t, pol)
         self._emit(
             t,
             "DECISION",
@@ -574,7 +592,8 @@ class Engine:
                 spread_view=view,
             )
             try:
-                proposal = self.policy_provider("SPREAD").decide(ctx)
+                pol = self.policy_provider("SPREAD")
+                proposal = pol.decide(ctx)
                 validate_spread_proposal(ctx, proposal)
             except PolicyError as e:
                 self._emit(
@@ -589,6 +608,7 @@ class Engine:
             self.decisions.append(
                 {"actor": agent.agent_id, "at": t.isoformat(), "proposal": proposal.kind}
             )
+            self._emit_witness(t, pol)
             self._emit(
                 t,
                 "DECISION",
@@ -639,6 +659,8 @@ class Engine:
                     reserve_per_spread_usd=res.reserve_usd,
                     max_risk_usd=self.profile.portfolio.max_per_spread_initial_risk_usd,
                     max_candidates=self.profile.universe.max_candidates_per_direction,
+                    target_dte=self.profile.universe.target_entry_dte_calendar_days,
+                    allowed_roots=tuple(self.profile.universe.allowed_contract_roots),
                 )
             )
             # One approved limit template per candidate (natural quote-side credit).

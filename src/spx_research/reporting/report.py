@@ -25,9 +25,13 @@ def event_log_digest(events: list[Event]) -> str:
 
 
 def run_manifest(
-    result: RunResult, profile: Profile, dataset_manifest_id: str | None
+    result: RunResult,
+    profile: Profile,
+    dataset_manifest_id: str | None,
+    extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
+        **(extra or {}),
         "run_id": result.run_id,
         "profile_id": profile.profile_id,
         "profile_mode": profile.mode,

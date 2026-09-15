@@ -47,6 +47,7 @@ class PolicyDeps:
     profile: Profile
     budget: Budget | None = None
     max_retries: int = 2
+    max_output_tokens: int = 800
     model_id: str = "mock-1"
     private_manifest_id: str = "local"
     system_prompts: dict[str, str] | None = None  # role -> prompt text
@@ -105,6 +106,7 @@ def _prepare(state: DecisionRun, deps: PolicyDeps) -> DecisionRun:
             packet=compiled.public,
             schema_name=_schema_name(ctx.role),
             model_id=deps.model_id,
+            max_output_tokens=deps.max_output_tokens,
         ),
         "attempts": 0,
     }

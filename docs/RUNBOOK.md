@@ -27,14 +27,17 @@ authority; checkpoints and reports are projections.
 3. **Model-call failure / budget exhaustion**: the scheduler pauses the
    decision barrier (agent state `PAUSED`) rather than inventing an action.
    Inspect `incidents` for rejected proposals (private; never feed back to a
-   model), then resume by re-running the barrier — the decision tape replays
-   already-validated responses by request hash (no duplicate billing).
+   model). There is no mid-run resume: restart the run from scratch with the
+   same `--tape` path — the decision tape replays already-validated
+   responses by request hash, so restarted barriers do not re-bill or
+   re-dispatch completed model calls.
 4. **Incident inspection**:
    `SELECT incident_id, code, at_utc FROM incidents WHERE run_id = :r` —
    `rejected_payload` is quarantined; do not copy it into prompts or memory.
-5. **Outbox drain**: rows in `outbox` with `emitted = false` are committed
-   side-effects awaiting dispatch; they are written atomically with their
-   event, so a missing row means the event never committed.
+5. **Outbox**: rows in `outbox` are committed side-effects written
+   atomically with their event — a missing row means the event never
+   committed. No drainer ships yet; the table is reserved for future
+   consumers and stays `emitted = false`.
 
 ## Isolation
 
@@ -47,8 +50,9 @@ authority; checkpoints and reports are projections.
 ## Budget
 
 `Budget` reserves estimated cost before dispatch and commits actuals after.
-`BUDGET_EXCEEDED` is a structured policy failure, not a crash. Check
-`costs` for per-request token/cost lineage.
+`BUDGET_EXCEEDED` is a structured policy failure, not a crash. Spend state
+is in-process (the `costs` table is reserved schema; nothing writes it yet),
+so a crashed run restarts its budget from zero — rerun with a fresh tape.
 
 ## Classification
 

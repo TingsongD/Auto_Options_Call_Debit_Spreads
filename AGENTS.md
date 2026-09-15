@@ -5,7 +5,12 @@ The governing specification is `../spx_ai_handover_v2/` (read `DEV_HANDOVER.md`,
 `AGENTS.md`). `docs/DECISIONS.md` lists unapproved owner choices — do not run
 real data or model calls until those gates clear.
 
-## Implemented (M0–M6)
+## Scaffolded across M0–M6 areas
+
+The spec's milestones are acceptance gates, not component checklists — the
+decision register (`../spx_ai_handover_v2/docs/DECISIONS.md` /
+`docs/DECISION_REGISTER.md`) is still all-pending, so nothing here may run
+against real data or real models. Present surface:
 
 - `config.py`, `preflight.py`, `contracts.py`: typed profiles, mode-aware
   preflight, spec-directory contract resolution (schemas/prompts are resolved

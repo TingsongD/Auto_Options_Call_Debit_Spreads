@@ -58,36 +58,55 @@ def verify_hash_chain(events: list[Event]) -> bool:
     return True
 
 
-def egress_scan_packets(tape_path: Path, run_id: str) -> list[dict[str, str]]:
-    """Run the egress gate over every public packet on a decision tape."""
+def egress_scan_packets(
+    tape_path: Path,
+    run_id: str,
+    *,
+    branch_id: str = "",
+    actor_ids: tuple[str, ...] = (),
+    private_manifest_id: str = "",
+) -> list[dict[str, str]]:
+    """Run the egress gate over every public packet on a decision tape.
+
+    Uses the run's real literals (branch, actors, private manifest) so the
+    scan matches the production gate's strength — not a weakened stand-in.
+    """
     from spx_research.epistemics.egress import egress_check
     from spx_research.epistemics.types import Context
 
     violations: list[dict[str, str]] = []
     if not tape_path.is_file():
         return violations
-    ctx = Context(
-        run_id=run_id,
-        branch_id="",
-        actor_id="",
-        actor_role="",
-        as_of=datetime.now(UTC),
-        session_index=0,
-        minute_from_open=0,
-        alias_namespace="",
-        private_manifest_id="",
-    )
+    contexts = [
+        Context(
+            run_id=run_id,
+            branch_id=branch_id,
+            actor_id=actor_id,
+            actor_role="",
+            as_of=datetime.now(UTC),
+            session_index=0,
+            minute_from_open=0,
+            alias_namespace=f"{run_id}:{branch_id}" if branch_id else "",
+            private_manifest_id=private_manifest_id,
+        )
+        for actor_id in (actor_ids or ("",))
+    ]
     for line in tape_path.read_text().splitlines():
         if not line.strip():
             continue
-        rec = json.loads(line)
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue  # torn tail — same tolerance as DecisionTape
         packet = rec.get("request", {}).get("packet")
         if packet is None:
             continue
-        try:
-            egress_check(packet, ctx)
-        except Exception as e:  # HarnessError: EGRESS_LEAK:*
-            violations.append({"request_hash": rec.get("request_hash", "?"), "code": str(e)})
+        for ctx in contexts:
+            try:
+                egress_check(packet, ctx)
+            except Exception as e:  # HarnessError: EGRESS_LEAK:*
+                violations.append({"request_hash": rec.get("request_hash", "?"), "code": str(e)})
+                break
     return violations
 
 
@@ -97,7 +116,8 @@ def evaluate_run(
     initial_cash: Decimal = Decimal("10000"),
 ) -> dict[str, Any]:
     """Fixed-classification evaluation for one run directory."""
-    events = load_events(run_dir / "events.jsonl")
+    events_path = run_dir / "events.jsonl"
+    events = load_events(events_path) if events_path.is_file() else []
     report: dict[str, Any] = {}
     rp = run_dir / "report.json"
     if rp.exists():
@@ -110,21 +130,53 @@ def evaluate_run(
     run_id = events[0].run_id if events else manifest.get("run_id", run_dir.name)
 
     st = replay(run_id, cash, events) if events else None
-    replay_ok = st is not None and (
-        not report.get("final_cash_usd")
-        or Decimal(str(st.account.cash)) == Decimal(str(report["final_cash_usd"]))
-    )
+    replay_ok: bool | None = None
+    if events:
+        replay_ok = st is not None and (
+            not report.get("final_cash_usd")
+            or Decimal(str(st.account.cash)) == Decimal(str(report["final_cash_usd"]))
+        )
     if tape_path is None:
         candidate = run_dir / "decision_tape.jsonl"
         tape_path = candidate if candidate.exists() else None
-    violations = egress_scan_packets(tape_path, run_id) if tape_path else []
+    branch_id = manifest.get("branch_id") or ""
+    if not branch_id and events:
+        branch_id = next(
+            (
+                str(e.payload["branch_id"])
+                for e in events
+                if e.type == "DECISION_WITNESS" and e.payload.get("branch_id")
+            ),
+            "",
+        )
+    actor_ids = tuple(
+        sorted(
+            {
+                str(e.payload["actor_id"])
+                for e in events
+                if e.type in ("DECISION_MADE", "DECISION_WITNESS") and e.payload.get("actor_id")
+            }
+        )
+    )
+    violations = (
+        egress_scan_packets(
+            tape_path,
+            run_id,
+            branch_id=branch_id,
+            actor_ids=actor_ids,
+            private_manifest_id=str(manifest.get("private_manifest_id") or ""),
+        )
+        if tape_path
+        else []
+    )
     return {
         "schema_version": "1.0",
         "run_id": run_id,
         "event_count": len(events),
         "event_log_sha256": event_log_digest(events) if events else None,
         "checks": {
-            "hash_chain_ok": verify_hash_chain(events),
+            "events_present": bool(events),
+            "hash_chain_ok": verify_hash_chain(events) if events else None,
             "replay_ok": replay_ok,
             "egress_violations": violations,
         },
@@ -148,8 +200,8 @@ def compare_runs(dir_a: Path, dir_b: Path) -> dict[str, Any]:
     """
     ev_a = load_events(dir_a / "events.jsonl")
     ev_b = load_events(dir_b / "events.jsonl")
-    da = event_log_digest(ev_a)
-    db = event_log_digest(ev_b)
+    da = _normalized_digest(ev_a)
+    db = _normalized_digest(ev_b)
     return {
         "run_a": ev_a[0].run_id if ev_a else str(dir_a),
         "run_b": ev_b[0].run_id if ev_b else str(dir_b),
@@ -157,3 +209,32 @@ def compare_runs(dir_a: Path, dir_b: Path) -> dict[str, Any]:
         "digest_b": db,
         "invariant": da == db,
     }
+
+
+def _normalized_digest(events: list[Event]) -> str | None:
+    """Event digest with the run's own run_id scrubbed.
+
+    ``run_id`` appears in the envelope and inside payloads (incident ids,
+    witnesses); identical *behavior* under different run ids must compare
+    equal. Hash-chain fields are excluded — they are verified separately by
+    ``verify_hash_chain``.
+    """
+    import hashlib
+
+    if not events:
+        return None
+    h = hashlib.sha256()
+    for e in sorted(events, key=lambda x: x.seq):
+        blob = json.dumps(
+            {
+                "seq": e.seq,
+                "sim_time_utc": e.sim_time_utc.isoformat(),
+                "phase": e.phase,
+                "type": e.type,
+                "payload": e.payload,
+            },
+            sort_keys=True,
+            default=str,
+        )
+        h.update(blob.replace(e.run_id, "<RUN>").encode() + b"\n")
+    return h.hexdigest()

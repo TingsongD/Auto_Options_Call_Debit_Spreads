@@ -6,9 +6,9 @@ import json
 import os
 from dataclasses import asdict
 from datetime import date, datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any, NoReturn
 
 import typer
 from pydantic import ValidationError
@@ -107,6 +107,18 @@ def run(
     end: Annotated[str | None, typer.Option()] = None,
     run_id: Annotated[str, typer.Option()] = "run-0001",
     store: Annotated[str, typer.Option(help="memory|postgres (dsn from SPX_DB_DSN)")] = "memory",
+    policy: Annotated[
+        str, typer.Option(help="mechanical|llm-mock|llm — decision policy")
+    ] = "mechanical",
+    tape: Annotated[Path | None, typer.Option(help="decision tape path (llm policies)")] = None,
+    model: Annotated[str | None, typer.Option(help="model id for --policy llm")] = None,
+    budget_usd: Annotated[str | None, typer.Option(help="API spend cap for --policy llm")] = None,
+    price_in_per_mtok: Annotated[
+        str | None, typer.Option(help="USD per million input tokens")
+    ] = None,
+    price_out_per_mtok: Annotated[
+        str | None, typer.Option(help="USD per million output tokens")
+    ] = None,
 ) -> None:
     """Execute the deterministic baseline engine over a dataset (M3)."""
     from spx_research.data.availability import Archive
@@ -141,6 +153,29 @@ def run(
         loss_trigger=-(lb[0] + lb[1]) / 2,
         loss_activation_days=profile.exit_policy.loss_activation_days_held,
     )
+    mft = json.loads((dataset_root / "manifest.json").read_text())
+    tape_path = tape or (out / "decision_tape.jsonl")
+    if policy == "mechanical":
+        policy_provider = lambda _role: mech  # noqa: E731
+    elif policy in ("llm-mock", "llm"):
+        try:
+            policy_provider = _llm_policy_provider(
+                policy=policy,
+                profile=profile,
+                run_id=run_id,
+                tape_path=tape_path,
+                model_id=model,
+                budget_usd=Decimal(budget_usd) if budget_usd else None,
+                price_in=Decimal(price_in_per_mtok) if price_in_per_mtok else None,
+                price_out=Decimal(price_out_per_mtok) if price_out_per_mtok else None,
+                manifest_id=str(mft.get("manifest_id", "local")),
+            )
+        except InvalidOperation:
+            typer.secho("invalid decimal in --budget-usd/--price-*", fg=typer.colors.RED, err=True)
+            raise typer.Exit(2) from None
+    else:
+        typer.secho(f"unknown policy {policy!r}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(2)
     if store == "postgres":
         dsn = os.environ.get("SPX_DB_DSN")
         if not dsn:
@@ -154,22 +189,133 @@ def run(
     else:
         typer.secho(f"unknown store {store!r}", fg=typer.colors.RED)
         raise typer.Exit(2)
-    engine = Engine(profile, cal, archive, event_store, lambda _role: mech, run_id=run_id)
+    engine = Engine(profile, cal, archive, event_store, policy_provider, run_id=run_id)
     result = engine.run(s, e)
 
-    mft = json.loads((dataset_root / "manifest.json").read_text())
     out.mkdir(parents=True, exist_ok=True)
     with (out / "events.jsonl").open("w") as fh:
         for ev in result.events:
             fh.write(json.dumps(asdict(ev), sort_keys=True, default=str) + "\n")
     (out / "run_manifest.json").write_text(
-        json.dumps(run_manifest(result, profile, mft.get("manifest_id")), indent=2)
+        json.dumps(
+            run_manifest(
+                result,
+                profile,
+                mft.get("manifest_id"),
+                extra={
+                    "branch_id": engine.branch_id,
+                    "policy": policy,
+                    "private_manifest_id": (
+                        str(mft.get("manifest_id", "local")) if policy != "mechanical" else ""
+                    ),
+                },
+            ),
+            indent=2,
+        )
     )
     (out / "report.json").write_text(json.dumps(summarize(result), indent=2))
     typer.secho(
         f"OK: {len(result.events)} events, cash={result.final_state.account.cash} -> {out}",
         fg=typer.colors.GREEN,
     )
+
+
+def _llm_policy_provider(
+    *,
+    policy: str,
+    profile: Any,
+    run_id: str,
+    tape_path: Path,
+    model_id: str | None,
+    budget_usd: Decimal | None,
+    price_in: Decimal | None,
+    price_out: Decimal | None,
+    manifest_id: str,
+) -> Any:
+    """Build a per-role LLMPolicy factory over one shared pipeline (B2).
+
+    ``llm-mock`` is fully offline; ``llm`` fails closed unless the profile
+    permits real model requests, OPENAI_API_KEY is set, a model id is known,
+    and a bounded budget with explicit price rates is configured.
+    """
+    import hashlib
+
+    from spx_research.agents.graphs import PolicyDeps
+    from spx_research.agents.llm_policy import LLMPolicy
+    from spx_research.contracts import SpecNotFoundError, load_prompt, load_schema
+    from spx_research.epistemics.harness import Harness
+    from spx_research.epistemics.store import InMemoryObservationLedger
+    from spx_research.llm.tape import DecisionTape
+
+    def _fail(msg: str) -> NoReturn:
+        typer.secho(msg, fg=typer.colors.RED, err=True)
+        raise typer.Exit(2)
+
+    try:
+        system_prompts = {
+            "manager": load_prompt("manager"),
+            "spread": load_prompt("spread_agent"),
+        }
+        schemas = {
+            "manager_decision": load_schema("manager_decision"),
+            "spread_decision": load_schema("spread_decision"),
+        }
+    except SpecNotFoundError as e:
+        _fail(f"spec contracts unavailable: {e}")
+
+    models = profile.models
+    if policy == "llm-mock":
+        from spx_research.llm.gateway import MockGateway
+
+        gateway: Any = MockGateway()
+        budget = None
+        mid = "mock-1"
+    else:
+        from spx_research.llm.budget import Budget, PriceSheet
+        from spx_research.llm.openai_gateway import OpenAIGateway
+
+        if not profile.permissions.real_model_requests:
+            _fail("--policy llm requires profile.permissions.real_model_requests: true")
+        api_key = os.environ.get("OPENAI_API_KEY")
+        if not api_key:
+            _fail("OPENAI_API_KEY is not set")
+        candidate = model_id or (
+            (models.manager_role_candidate or models.spread_role_candidate) if models else None
+        )
+        if not candidate:
+            _fail("no model id: pass --model or set models.*_role_candidate in the profile")
+        mid = candidate
+        cap = budget_usd or (models.experiment_api_budget_usd if models else None)
+        if cap is None or price_in is None or price_out is None:
+            _fail(
+                "--policy llm requires a bounded budget: --budget-usd "
+                "(or models.experiment_api_budget_usd) plus "
+                "--price-in-per-mtok and --price-out-per-mtok"
+            )
+        import openai
+
+        sheet = PriceSheet("cli", mid, price_in, price_out)
+        gateway = OpenAIGateway(openai.OpenAI(api_key=api_key), mid, sheet, allow_real_calls=True)
+        budget = Budget(cap, sheet)
+
+    tape_path.parent.mkdir(parents=True, exist_ok=True)
+    alias_key = hashlib.sha256(f"spx-alias:{manifest_id}:{run_id}".encode()).digest()
+    deps = PolicyDeps(
+        harness=Harness(alias_key),
+        ledger=InMemoryObservationLedger(),
+        gateway=gateway,
+        tape=DecisionTape(tape_path),
+        profile=profile,
+        budget=budget,
+        max_retries=models.retry_attempts_after_initial if models else 2,
+        max_output_tokens=models.max_output_tokens_per_call if models else 800,
+        model_id=mid,
+        private_manifest_id=manifest_id,
+        system_prompts=system_prompts,
+        schemas=schemas,
+    )
+    pol = LLMPolicy(deps)
+    return lambda _role: pol
 
 
 @app.command()
