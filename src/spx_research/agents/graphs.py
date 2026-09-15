@@ -30,7 +30,7 @@ from spx_research.epistemics.producers import (
     spread_atoms,
     spread_menu,
 )
-from spx_research.epistemics.store import Incident, ObservationLedger
+from spx_research.epistemics.store import AssessmentRecord, Incident, ObservationLedger
 from spx_research.epistemics.types import Atom, Compiled, Context, MenuChoice
 from spx_research.llm.budget import Budget
 from spx_research.llm.gateway import ModelGateway
@@ -177,6 +177,27 @@ def _resolve(state: DecisionRun, deps: PolicyDeps) -> DecisionRun:
     action_id = state["response"].parsed["action_id"]
     choice = state["compiled"].action_map[action_id]
     parsed = state["response"].parsed
+    ctx = state["ctx"]
+    # Bounded memory: validated assessment updates enter the actor's private
+    # belief state and re-appear in later packets as typed assessments — never
+    # as facts, never as raw prose (H-02).
+    premise_map = state["compiled"].premise_map
+    for u in parsed.get("assessment_updates", []):
+        deps.ledger.put_assessment(
+            AssessmentRecord(
+                actor_id=ctx.actor_id,
+                topic=u["topic"],
+                assessment=u["assessment"],
+                confidence_label=u["confidence_label"],
+                premise_atom_ids=tuple(
+                    premise_map[t].atom_id for t in u["premise_tokens"] if t in premise_map
+                ),
+                accepted_at=ctx.as_of_utc,
+                decision_token=parsed["decision_token"],
+                run_id=ctx.run_id,
+                branch_id=ctx.branch_id,
+            )
+        )
     proposal = Proposal(
         kind=choice.kind,
         candidate_id=(choice.target_internal_id if choice.kind == "OPEN" else None),

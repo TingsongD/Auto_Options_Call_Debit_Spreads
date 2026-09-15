@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import asdict
 from datetime import date, datetime
 from decimal import Decimal
@@ -105,11 +106,13 @@ def run(
     start: Annotated[str | None, typer.Option()] = None,
     end: Annotated[str | None, typer.Option()] = None,
     run_id: Annotated[str, typer.Option()] = "run-0001",
+    store: Annotated[str, typer.Option(help="memory|postgres (dsn from SPX_DB_DSN)")] = "memory",
 ) -> None:
     """Execute the deterministic baseline engine over a dataset (M3)."""
     from spx_research.data.availability import Archive
     from spx_research.engine.scheduler import Engine
     from spx_research.persistence.events import InMemoryEventStore
+    from spx_research.persistence.postgres import PostgresEventStore, create_engine
     from spx_research.reporting.report import run_manifest, summarize
     from spx_research.research.mechanical import MechanicalPolicy
     from spx_research.temporal.calendar import load_manifest
@@ -138,7 +141,16 @@ def run(
         loss_trigger=-(lb[0] + lb[1]) / 2,
         loss_activation_days=profile.exit_policy.loss_activation_days_held,
     )
-    engine = Engine(profile, cal, archive, InMemoryEventStore(), lambda _role: mech, run_id=run_id)
+    if store == "postgres":
+        event_store: InMemoryEventStore | PostgresEventStore = PostgresEventStore(
+            create_engine(os.environ["SPX_DB_DSN"])
+        )
+    elif store == "memory":
+        event_store = InMemoryEventStore()
+    else:
+        typer.secho(f"unknown store {store!r}", fg=typer.colors.RED)
+        raise typer.Exit(2)
+    engine = Engine(profile, cal, archive, event_store, lambda _role: mech, run_id=run_id)
     result = engine.run(s, e)
 
     mft = json.loads((dataset_root / "manifest.json").read_text())
@@ -154,6 +166,18 @@ def run(
         f"OK: {len(result.events)} events, cash={result.final_state.account.cash} -> {out}",
         fg=typer.colors.GREEN,
     )
+
+
+@app.command()
+def migrate() -> None:
+    """Apply Alembic migrations to SPX_DB_DSN (M5-01)."""
+    from alembic.config import Config
+
+    from alembic import command
+
+    cfg = Config(str(Path(__file__).resolve().parents[3] / "alembic.ini"))
+    command.upgrade(cfg, "head")
+    typer.secho("OK: migrations applied", fg=typer.colors.GREEN)
 
 
 @app.command()

@@ -26,6 +26,8 @@ class AssessmentRecord:
     premise_atom_ids: tuple[str, ...]
     accepted_at: datetime
     decision_token: str
+    run_id: str = ""
+    branch_id: str = ""
 
 
 @dataclass(frozen=True)
