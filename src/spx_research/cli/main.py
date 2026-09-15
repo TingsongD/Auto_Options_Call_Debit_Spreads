@@ -182,6 +182,7 @@ def run(
                 policy=policy,
                 profile=profile,
                 run_id=run_id,
+                branch_id="main",
                 tape_path=tape_path,
                 model_id=model,
                 budget_usd=Decimal(budget_usd) if budget_usd else None,
@@ -215,6 +216,7 @@ def run(
                     "private_manifest_id": (
                         str(mft.get("manifest_id", "local")) if policy != "mechanical" else ""
                     ),
+                    "policy_meta": getattr(policy_provider, "meta", {}),
                 },
             ),
             indent=2,
@@ -232,6 +234,7 @@ def _llm_policy_provider(
     policy: str,
     profile: Any,
     run_id: str,
+    branch_id: str,
     tape_path: Path,
     model_id: str | None,
     budget_usd: Decimal | None,
@@ -245,8 +248,14 @@ def _llm_policy_provider(
     ``llm-mock`` is fully offline; ``llm`` fails closed unless the profile
     permits real model requests, OPENAI_API_KEY is set, a model id is known,
     and a bounded budget with explicit price rates is configured.
+
+    ``models.resolved_model_ids_manifest`` (a JSON file ``{"manager_role":
+    ..., "spread_role": ...}``) pins per-role model ids; ``--model``
+    overrides both roles. ``models.price_sheet_id`` (a JSON file
+    ``{"model_id", "input_per_mtok", "output_per_mtok"}``) supplies prices
+    when ``--price-*`` are not given.
     """
-    import hashlib
+    import hmac as hmac_mod
 
     from spx_research.agents.graphs import PolicyDeps
     from spx_research.agents.llm_policy import LLMPolicy
@@ -271,6 +280,25 @@ def _llm_policy_provider(
         _fail(f"spec contracts unavailable: {e}")
 
     models = profile.models
+    # Pinned per-role ids: the resolved-model-ids manifest wins over the
+    # loose *_role_candidate fields; --model overrides everything.
+    role_ids: dict[str, str] = {}
+    if models and models.resolved_model_ids_manifest:
+        try:
+            resolved = json.loads(Path(models.resolved_model_ids_manifest).read_text())
+        except (OSError, json.JSONDecodeError) as e:
+            _fail(f"cannot read resolved_model_ids_manifest: {e}")
+        for key, role in (("manager_role", "manager"), ("spread_role", "spread")):
+            if resolved.get(key):
+                role_ids[role] = str(resolved[key])
+    if model_id:
+        role_ids = {"manager": model_id, "spread": model_id}
+    if models:
+        role_ids.setdefault("manager", models.manager_role_candidate or "")
+        role_ids.setdefault("spread", models.spread_role_candidate or "")
+    role_ids = {r: m for r, m in role_ids.items() if m}
+
+    sheet: Any = None
     if policy == "llm-mock":
         from spx_research.llm.gateway import MockGateway
 
@@ -286,27 +314,48 @@ def _llm_policy_provider(
         api_key = os.environ.get("OPENAI_API_KEY")
         if not api_key:
             _fail("OPENAI_API_KEY is not set")
-        candidate = model_id or (
-            (models.manager_role_candidate or models.spread_role_candidate) if models else None
-        )
-        if not candidate:
-            _fail("no model id: pass --model or set models.*_role_candidate in the profile")
-        mid = candidate
+        if not role_ids:
+            _fail(
+                "no model ids: pass --model, set models.*_role_candidate, or "
+                "point models.resolved_model_ids_manifest at a resolved file"
+            )
+        mid = role_ids.get("manager") or next(iter(role_ids.values()))
         cap = budget_usd or (models.experiment_api_budget_usd if models else None)
-        if cap is None or price_in is None or price_out is None:
+        if price_in is not None and price_out is not None:
+            sheet = PriceSheet("cli", mid, price_in, price_out)
+        elif models and models.price_sheet_id:
+            try:
+                ps = json.loads(Path(models.price_sheet_id).read_text())
+                sheet = PriceSheet(
+                    models.price_sheet_id,
+                    str(ps["model_id"]),
+                    Decimal(str(ps["input_per_mtok"])),
+                    Decimal(str(ps["output_per_mtok"])),
+                )
+            except (OSError, json.JSONDecodeError, KeyError, InvalidOperation) as e:
+                _fail(f"cannot read price_sheet_id {models.price_sheet_id}: {e}")
+        if cap is None or sheet is None:
             _fail(
                 "--policy llm requires a bounded budget: --budget-usd "
                 "(or models.experiment_api_budget_usd) plus "
-                "--price-in-per-mtok and --price-out-per-mtok"
+                "--price-in-per-mtok/--price-out-per-mtok (or models.price_sheet_id)"
             )
         import openai
 
-        sheet = PriceSheet("cli", mid, price_in, price_out)
         gateway = OpenAIGateway(openai.OpenAI(api_key=api_key), mid, sheet, allow_real_calls=True)
         budget = Budget(cap, sheet)
 
     tape_path.parent.mkdir(parents=True, exist_ok=True)
-    alias_key = hashlib.sha256(f"spx-alias:{manifest_id}:{run_id}".encode()).digest()
+    # Public-token secrecy comes from an operator-held secret, never from
+    # run inputs: deriving the alias key from the dataset manifest id would
+    # make every public token a function of the archive's full content
+    # (including its future) and defeat the future-suffix probe.
+    alias_secret = os.environ.get("SPX_ALIAS_KEY", "")
+    if len(alias_secret) < 16:
+        _fail("SPX_ALIAS_KEY is not set (or <16 chars) — required for public token derivation")
+    alias_key = hmac_mod.new(
+        alias_secret.encode(), f"{run_id}:{branch_id}".encode(), "sha256"
+    ).digest()
     deps = PolicyDeps(
         harness=Harness(alias_key),
         ledger=ledger,
@@ -317,12 +366,22 @@ def _llm_policy_provider(
         max_retries=models.retry_attempts_after_initial if models else 2,
         max_output_tokens=models.max_output_tokens_per_call if models else 800,
         model_id=mid,
+        model_ids=role_ids or None,
         private_manifest_id=manifest_id,
         system_prompts=system_prompts,
         schemas=schemas,
+        retry_backoff_seconds=2.0 if policy == "llm" else 0.0,
     )
     pol = LLMPolicy(deps)
-    return lambda _role: pol
+
+    def provider(_role: str) -> Any:
+        return pol
+
+    provider.meta = {  # type: ignore[attr-defined]
+        "resolved_model_ids": role_ids or {"*": mid},
+        "price_sheet_id": getattr(sheet, "sheet_id", None) if sheet else None,
+    }
+    return provider
 
 
 @app.command()

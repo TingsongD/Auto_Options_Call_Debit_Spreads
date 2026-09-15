@@ -12,7 +12,9 @@ saver for M4; the durable checkpointer arrives with the Postgres milestone.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import hashlib
+import time
+from dataclasses import dataclass, replace
 from decimal import Decimal
 from typing import Any, TypedDict
 
@@ -21,7 +23,7 @@ from langgraph.graph import END, StateGraph
 
 from spx_research.config import Profile
 from spx_research.engine.policy import DecisionContext, PolicyError, Proposal
-from spx_research.epistemics.harness import Harness
+from spx_research.epistemics.harness import Harness, digest
 from spx_research.epistemics.producers import (
     compile_for_actor,
     make_context,
@@ -32,7 +34,13 @@ from spx_research.epistemics.producers import (
 )
 from spx_research.epistemics.reducer import reduce_belief
 from spx_research.epistemics.store import AssessmentRecord, Incident, ObservationLedger
-from spx_research.epistemics.types import Atom, Compiled, Context, MenuChoice
+from spx_research.epistemics.types import (
+    Atom,
+    Compiled,
+    Context,
+    HarnessError,
+    MenuChoice,
+)
 from spx_research.llm.budget import Budget
 from spx_research.llm.gateway import ModelGateway
 from spx_research.llm.tape import DecisionTape
@@ -50,6 +58,8 @@ class PolicyDeps:
     max_retries: int = 2
     max_output_tokens: int = 800
     model_id: str = "mock-1"
+    model_ids: dict[str, str] | None = None  # per-role pin overrides model_id
+    retry_backoff_seconds: float = 0.0  # pause between failed attempts
     private_manifest_id: str = "local"
     system_prompts: dict[str, str] | None = None  # role -> prompt text
     schemas: dict[str, dict[str, Any]] | None = None  # schema_name -> schema
@@ -109,6 +119,9 @@ def _prepare(state: DecisionRun, deps: PolicyDeps) -> DecisionRun:
         premise_ids={a.atom_id for a in atoms},
         prior_belief_hash=prior.belief_hash,
     )
+    schema_name = _schema_name(ctx.role)
+    schema = (deps.schemas or {}).get(schema_name)
+    system_text = (deps.system_prompts or {}).get(ctx.role.lower(), "")
     return {
         "hctx": hctx,
         "atoms": atoms,
@@ -117,9 +130,15 @@ def _prepare(state: DecisionRun, deps: PolicyDeps) -> DecisionRun:
         "request": ModelRequest(
             system_prompt_id=f"{ctx.role.lower()}_v2",
             packet=compiled.public,
-            schema_name=_schema_name(ctx.role),
-            model_id=deps.model_id,
+            schema_name=schema_name,
+            model_id=deps.model_ids.get(ctx.role.lower(), deps.model_id)
+            if deps.model_ids
+            else deps.model_id,
             max_output_tokens=deps.max_output_tokens,
+            system_prompt_hash=(
+                hashlib.sha256(system_text.encode()).hexdigest() if system_text else ""
+            ),
+            schema_hash=digest(schema) if schema is not None else "",
         ),
         "attempts": 0,
     }
@@ -127,9 +146,13 @@ def _prepare(state: DecisionRun, deps: PolicyDeps) -> DecisionRun:
 
 def _call_model(state: DecisionRun, deps: PolicyDeps) -> DecisionRun:
     req = state["request"]
+    if state.get("error"):
+        # Retry: the request carries only the prior failure's code — never
+        # the rejected prose (quarantined in the incident vault).
+        req = replace(req, retry_error_code=state["error"])
     rec = deps.tape.lookup(req.request_hash())
     if rec is not None:
-        return {"response": rec.response, "error": ""}
+        return {"response": rec.response, "request": req, "error": ""}
     reservation = Decimal(0)
     try:
         if deps.budget is not None:
@@ -142,12 +165,17 @@ def _call_model(state: DecisionRun, deps: PolicyDeps) -> DecisionRun:
     except ModelError as e:
         if deps.budget is not None and reservation:
             deps.budget.abort(reservation)
+        if deps.retry_backoff_seconds > 0 and state.get("attempts", 0) < deps.max_retries:
+            # Provider-side failures (RATE_LIMIT/TRANSPORT/TIMEOUT) get a
+            # real-time pause before redispatch instead of instantly burning
+            # the remaining attempts.
+            time.sleep(deps.retry_backoff_seconds)
         return {"error": e.code, "attempts": state.get("attempts", 0) + 1}
     if deps.budget is not None:
         deps.budget.commit(reservation, Decimal(str(resp.cost_usd)))
     # Tape only validated responses (see _validate): a rejected response is
     # quarantined, never replayed, and a retry must re-dispatch the request.
-    return {"response": resp, "error": ""}
+    return {"response": resp, "request": req, "error": ""}
 
 
 def ctx_role(state: DecisionRun) -> str:
@@ -158,10 +186,20 @@ def _validate(state: DecisionRun, deps: PolicyDeps) -> DecisionRun:
     if state.get("error"):
         return {}
     ctx = state["ctx"]
-    try:
-        witness = deps.harness.validate(state["response"].parsed, state["compiled"])
-    except Exception as e:  # HarnessError or schema-shape failure
-        code = str(e) if isinstance(e, ValueError) else "SCHEMA"
+    parsed = state["response"].parsed
+    code = ""
+    witness: dict[str, Any] = {}
+    if not isinstance(parsed, dict):
+        code = "SCHEMA"  # response wasn't even an object — a model fault
+    else:
+        try:
+            # Only structural model-output failures (HarnessError) become
+            # quarantined incidents; a programming error here must crash,
+            # not be mislabeled as a model schema failure.
+            witness = deps.harness.validate(parsed, state["compiled"])
+        except HarnessError as e:
+            code = str(e)
+    if code:
         deps.ledger.quarantine(
             Incident(
                 deps.ledger.next_incident_id(ctx.run_id),
@@ -169,7 +207,7 @@ def _validate(state: DecisionRun, deps: PolicyDeps) -> DecisionRun:
                 ctx.branch_id,
                 ctx.actor_id,
                 code,
-                dict(state["response"].parsed),
+                parsed if isinstance(parsed, dict) else {"raw": str(parsed)[:500]},
                 ctx.as_of_utc,
             )
         )

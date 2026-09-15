@@ -14,6 +14,7 @@ from decimal import Decimal
 from typing import Any
 
 import pytest
+import typer
 
 from spx_research.agents.graphs import PolicyDeps, run_decision
 from spx_research.agents.llm_policy import LLMPolicy
@@ -434,3 +435,161 @@ def test_engine_macro_vintages_reach_manager_only_after_availability(
     assert mins, "scheduled meeting never surfaced as minutes_to_meeting"
     assert all(m.value.isdigit() for m in mins)
     assert not any(atoms[d.atom_id].metric == "FED_MEETING_SCHEDULE" for d in deliveries)
+
+
+def test_request_hash_binds_prompt_and_schema_bytes(tmp_path: Any) -> None:
+    """Editing the spec prompt or schema must rotate request identity — an
+    old tape must not replay under a different prompt."""
+    req_a = ModelRequest("spread_v2", {"x": 1}, "spread_decision", "m")
+    req_b = ModelRequest(
+        "spread_v2", {"x": 1}, "spread_decision", "m", system_prompt_hash="abc"
+    )
+    req_c = ModelRequest(
+        "spread_v2", {"x": 1}, "spread_decision", "m", system_prompt_hash="def"
+    )
+    req_d = ModelRequest(
+        "spread_v2",
+        {"x": 1},
+        "spread_decision",
+        "m",
+        system_prompt_hash="abc",
+        schema_hash="s1",
+    )
+    assert len({r.request_hash() for r in (req_a, req_b, req_c, req_d)}) == 4
+
+
+def test_retry_request_carries_only_error_code(tmp_path: Any) -> None:
+    """The retry request is a different request that carries the prior
+    failure's code — never the rejected prose."""
+
+    class BadThenGood:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+            self.good = MockGateway()
+
+        def complete(
+            self, req: ModelRequest, system_text: str = "", schema: dict | None = None
+        ) -> ModelResponse:
+            self.calls.append(req.retry_error_code)
+            if len(self.calls) == 1:
+                bad = dict(self.good.complete(req).parsed)
+                bad["action_id"] = "act_forged"
+                return ModelResponse(
+                    req.request_hash(), json.dumps(bad), bad, "mock-1", 0, 0, Decimal(0)
+                )
+            return self.good.complete(req)
+
+    gw = BadThenGood()
+    deps = _deps(tmp_path, gw)
+    proposal, _, _ = run_decision(deps, _spread_ctx(with_candidate=False))
+    assert proposal.kind == "WAIT"
+    assert gw.calls == ["", "UNKNOWN_ACTION"]
+
+
+def test_non_dict_response_is_schema_incident_not_crash(tmp_path: Any) -> None:
+    class NonDict:
+        def complete(
+            self, req: ModelRequest, system_text: str = "", schema: dict | None = None
+        ) -> ModelResponse:
+            return ModelResponse(req.request_hash(), "[]", [], "mock-1", 0, 0, Decimal(0))  # type: ignore[arg-type]
+
+    deps = _deps(tmp_path, NonDict(), max_retries=0)
+    with pytest.raises(PolicyError):
+        run_decision(deps, _spread_ctx(with_candidate=False))
+    incidents = deps.ledger.incidents("run-1")
+    assert len(incidents) == 1 and incidents[0].code == "SCHEMA"
+
+
+def test_validator_programming_error_propagates(tmp_path: Any) -> None:
+    """A bug inside validate() must crash loudly — not be quarantined as a
+    model schema failure."""
+    deps = _deps(tmp_path)
+
+    def boom(p: Any, c: Any) -> Any:
+        raise TypeError("internal bug")
+
+    deps.harness.validate = boom  # type: ignore[method-assign]
+    with pytest.raises(TypeError, match="internal bug"):
+        run_decision(deps, _spread_ctx(with_candidate=False))
+    assert deps.ledger.incidents("run-1") == []
+
+
+def test_alias_key_is_secret_scoped_not_manifest_derived(tmp_path: Any) -> None:
+    """Public tokens must depend on the operator secret + run scope only —
+    the dataset manifest id (which may be content-addressed over the full
+    archive including its future) must not enter the derivation."""
+    import os
+
+    from spx_research.cli.main import _llm_policy_provider
+    from spx_research.config import Profile
+    from tests.unit.test_baseline_engine import _profile_dict
+
+    profile = Profile.model_validate(_profile_dict())
+    os.environ.pop("SPX_ALIAS_KEY", None)
+    kw = dict(
+        policy="llm-mock",
+        profile=profile,
+        run_id="run-x",
+        branch_id="main",
+        tape_path=tmp_path / "t.jsonl",
+        model_id=None,
+        budget_usd=None,
+        price_in=None,
+        price_out=None,
+        ledger=InMemoryObservationLedger(),
+    )
+    with pytest.raises(typer.Exit):
+        _llm_policy_provider(manifest_id="mft-a", **kw)  # no secret -> closed
+    os.environ["SPX_ALIAS_KEY"] = "test-secret-key-value"
+    try:
+        pa = _llm_policy_provider(manifest_id="mft-a", **kw)
+        pb = _llm_policy_provider(manifest_id="mft-different-future", **kw)
+        pol_a, pol_b = pa("MANAGER"), pb("MANAGER")
+        tok_a = pol_a.deps.harness.token("ns", "ev", "same-atom")
+        tok_b = pol_b.deps.harness.token("ns", "ev", "same-atom")
+        assert tok_a == tok_b  # manifest content cannot move public tokens
+        pc = _llm_policy_provider(manifest_id="mft-a", **{**kw, "run_id": "run-y"})
+        tok_c = pc("MANAGER").deps.harness.token("ns", "ev", "same-atom")
+        assert tok_c != tok_a  # run scope still separates token namespaces
+    finally:
+        os.environ.pop("SPX_ALIAS_KEY", None)
+
+
+def test_model_manifest_pins_per_role_ids(tmp_path: Any) -> None:
+    """models.resolved_model_ids_manifest is consumed, not just declared."""
+    import os
+
+    from spx_research.cli.main import _llm_policy_provider
+    from spx_research.config import Profile
+    from tests.unit.test_baseline_engine import _profile_dict
+
+    manifest = tmp_path / "models.json"
+    manifest.write_text(
+        json.dumps({"manager_role": "gpt-mgr-2024-01", "spread_role": "gpt-spr-2024-01"})
+    )
+    cfg = _profile_dict()
+    cfg["models"] = {"resolved_model_ids_manifest": str(manifest)}
+    profile = Profile.model_validate(cfg)
+    os.environ["SPX_ALIAS_KEY"] = "test-secret-key-value"
+    try:
+        provider = _llm_policy_provider(
+            policy="llm-mock",
+            profile=profile,
+            run_id="run-x",
+            branch_id="main",
+            tape_path=tmp_path / "t.jsonl",
+            model_id=None,
+            budget_usd=None,
+            price_in=None,
+            price_out=None,
+            manifest_id="mft-a",
+            ledger=InMemoryObservationLedger(),
+        )
+        pol = provider("MANAGER")
+        assert pol.deps.model_ids == {
+            "manager": "gpt-mgr-2024-01",
+            "spread": "gpt-spr-2024-01",
+        }
+        assert provider.meta["resolved_model_ids"]["spread"] == "gpt-spr-2024-01"  # type: ignore[attr-defined]
+    finally:
+        os.environ.pop("SPX_ALIAS_KEY", None)
