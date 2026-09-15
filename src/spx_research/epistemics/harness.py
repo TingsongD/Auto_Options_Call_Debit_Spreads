@@ -132,6 +132,7 @@ class Harness:
             "UNKNOWN_FUTURE_POLICY_PATH",
             "UNKNOWN_FUTURE_PRICE_PATH",
         ),
+        premise_ids: set[str] | None = None,
     ) -> Compiled:
         aware(ctx.as_of)
         if ctx.actor_role not in ACTIONS:
@@ -159,6 +160,8 @@ class Harness:
             a = atoms[atom_id]
             token = self.token(ctx.alias_namespace, "ev", atom_id)
             premise_map[token] = a
+            if premise_ids is not None and atom_id not in premise_ids:
+                continue
             premises.append(
                 {
                     "token": token,

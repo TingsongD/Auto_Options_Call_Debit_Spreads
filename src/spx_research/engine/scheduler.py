@@ -149,12 +149,12 @@ class Engine:
             },
         )
         last_t = boot
-        for sess in self.calendar.session_days(start, end):
-            last_t = self._session(sess)
+        for session_index, sess in enumerate(self.calendar.session_days(start, end)):
+            last_t = self._session(sess, session_index)
         self._emit(last_t, "RUN", "RUN_ENDED", {})
         return RunResult(self.run_id, self.store.events(self.run_id), self.state, self.decisions)
 
-    def _session(self, sess: SessionDay) -> datetime:
+    def _session(self, sess: SessionDay, session_index: int) -> datetime:
         p = self.profile
         assert p.clock is not None
         grid = set(self.calendar.review_times(sess.day, p.clock.agent_review_minutes))
@@ -170,10 +170,10 @@ class Engine:
             if offset == last_offset:
                 self._session_close(sess, t)
             elif self._manager_due:
-                self._manager_review(t, sess, offset)
+                self._manager_review(t, sess, offset, session_index)
                 self._manager_due = False
             if t in grid:
-                self._spread_reviews(sess, t, offset)
+                self._spread_reviews(sess, t, offset, session_index)
         # PM-settled positions: values publish after the close (synthetic:
         # close+30m). One post-close pass books same-day settlement; if the
         # value is still absent the per-minute check retries next session.
@@ -414,7 +414,9 @@ class Engine:
             )
         return tuple(facts)
 
-    def _manager_review(self, t: datetime, sess: SessionDay, offset: int) -> None:
+    def _manager_review(
+        self, t: datetime, sess: SessionDay, offset: int, session_index: int
+    ) -> None:
         p = self.profile
         assert p.portfolio is not None
         counts = self._direction_counts()
@@ -445,19 +447,22 @@ class Engine:
             "manager-1",
             "MANAGER",
             t,
-            session_index=0,
+            session_index=session_index,
             minute_from_open=offset,
             manager_view=view,
         )
+        pol: Policy | None = None
         try:
             pol = self.policy_provider("MANAGER")
             proposal = pol.decide(ctx)
             validate_manager_proposal(ctx, proposal)
             self._check_manager_capacity(proposal, t)
         except PolicyError as e:
+            self._discard_pending(pol, ctx)
             self._emit(t, "DECISION", "BARRIER_PAUSED", {"actor_id": "manager-1", "code": e.code})
             return
         except Rejection as e:
+            self._discard_pending(pol, ctx)
             self.decisions.append(
                 {
                     "actor": "manager-1",
@@ -485,6 +490,7 @@ class Engine:
             },
         )
         self._apply_manager(t, proposal)
+        self._commit_pending(pol, ctx)
 
     def _reservation_reserve_usd(self, t: datetime) -> Decimal:
         """Full-width encumbrance for any candidate using the real contract
@@ -574,7 +580,9 @@ class Engine:
                 )
                 self._retire_agent(res.agent_id, t, "CANCELLED")
 
-    def _spread_reviews(self, sess: SessionDay, t: datetime, offset: int) -> None:
+    def _spread_reviews(
+        self, sess: SessionDay, t: datetime, offset: int, session_index: int
+    ) -> None:
         for agent in sorted(self.state.live_agents(), key=lambda a: a.agent_id):
             if agent.role != "SPREAD" or agent.next_review_at_utc > t:
                 continue
@@ -587,20 +595,23 @@ class Engine:
                 agent.agent_id,
                 "SPREAD",
                 t,
-                session_index=0,
+                session_index=session_index,
                 minute_from_open=offset,
                 spread_view=view,
             )
+            pol: Policy | None = None
             try:
                 pol = self.policy_provider("SPREAD")
                 proposal = pol.decide(ctx)
                 validate_spread_proposal(ctx, proposal)
             except PolicyError as e:
+                self._discard_pending(pol, ctx)
                 self._emit(
                     t, "DECISION", "BARRIER_PAUSED", {"actor_id": agent.agent_id, "code": e.code}
                 )
                 continue
             except Rejection as e:
+                self._discard_pending(pol, ctx)
                 self._emit(
                     t, "DECISION", "DECISION_REJECTED", {"actor_id": agent.agent_id, "code": e.code}
                 )
@@ -620,6 +631,7 @@ class Engine:
                 },
             )
             self._apply_spread(agent, view, t, proposal)
+            self._commit_pending(pol, ctx)
 
     def _spread_view(self, agent: Any, sess: SessionDay, t: datetime) -> SpreadView:
         pos = self.state.positions.get(agent.position_id) if agent.position_id else None
@@ -730,6 +742,27 @@ class Engine:
             self._agent_state(agent.agent_id, agent.state.name, t, self._next_grid(t))
 
     # -- helpers ------------------------------------------------------------
+
+    @staticmethod
+    def _commit_pending(pol: Policy | None, ctx: DecisionContext) -> None:
+        """Persist assessments staged by an LLM policy now that the engine
+        has accepted the proposal. Non-LLM policies stage nothing."""
+        if pol is None:
+            return
+        commit = getattr(pol, "commit", None)
+        if callable(commit):
+            commit(ctx)
+
+    @staticmethod
+    def _discard_pending(pol: Policy | None, ctx: DecisionContext) -> None:
+        """Drop staged assessments for a proposal the engine rejected (or a
+        barrier that failed) — a decision that never took effect leaves no
+        belief-state trace."""
+        if pol is None:
+            return
+        discard = getattr(pol, "discard", None)
+        if callable(discard):
+            discard(ctx)
 
     def _agent_state(
         self,

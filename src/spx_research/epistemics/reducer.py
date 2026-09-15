@@ -15,6 +15,7 @@ from spx_research.epistemics.store import AssessmentRecord, ObservationLedger
 from spx_research.epistemics.types import Atom, Context
 
 BASE_UNKNOWNS = ("UNKNOWN_FUTURE_POLICY_PATH", "UNKNOWN_FUTURE_PRICE_PATH")
+MAX_CARRIED_ASSESSMENTS = 16
 
 
 @dataclass(frozen=True)
@@ -56,7 +57,7 @@ def reduce_belief(
                 if r.accepted_at <= ctx.as_of
             ),
             key=lambda r: (r.accepted_at, r.topic),
-        )
+        )[-MAX_CARRIED_ASSESSMENTS:]
     )
     unknowns = tuple(sorted(set(BASE_UNKNOWNS) | set(extra_unknowns)))
     blob = {

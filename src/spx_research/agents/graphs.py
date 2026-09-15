@@ -30,6 +30,7 @@ from spx_research.epistemics.producers import (
     spread_atoms,
     spread_menu,
 )
+from spx_research.epistemics.reducer import reduce_belief
 from spx_research.epistemics.store import AssessmentRecord, Incident, ObservationLedger
 from spx_research.epistemics.types import Atom, Compiled, Context, MenuChoice
 from spx_research.llm.budget import Budget
@@ -64,6 +65,7 @@ class DecisionRun(TypedDict, total=False):
     response: ModelResponse
     witness: dict[str, Any]
     proposal: Proposal
+    pending_assessments: list[AssessmentRecord]
     error: str
     attempts: int
 
@@ -82,9 +84,6 @@ def _prepare(state: DecisionRun, deps: PolicyDeps) -> DecisionRun:
         assert ctx.manager_view is not None
         atoms = manager_atoms(ctx.manager_view, ctx.as_of_utc)
         menu = manager_menu(ctx.manager_view, atoms)
-    for a in atoms:
-        deps.ledger.put_atom(a)
-        deps.ledger.deliver(ctx.run_id, ctx.branch_id, ctx.actor_id, a.atom_id, ctx.as_of_utc)
     hctx = make_context(
         ctx.run_id,
         ctx.branch_id,
@@ -95,7 +94,21 @@ def _prepare(state: DecisionRun, deps: PolicyDeps) -> DecisionRun:
         ctx.minute_from_open,
         deps.private_manifest_id,
     )
-    compiled = compile_for_actor(deps.ledger, deps.harness, hctx, menu)
+    # The prior belief is what the actor was entitled to *before* this
+    # barrier's atoms land — reduce before delivering so the packet's
+    # prior_belief_token names the prior state, not the one it creates.
+    prior = reduce_belief(deps.ledger, deps.harness, hctx)
+    for a in atoms:
+        deps.ledger.put_atom(a)
+        deps.ledger.deliver(ctx.run_id, ctx.branch_id, ctx.actor_id, a.atom_id, ctx.as_of_utc)
+    compiled = compile_for_actor(
+        deps.ledger,
+        deps.harness,
+        hctx,
+        menu,
+        premise_ids={a.atom_id for a in atoms},
+        prior_belief_hash=prior.belief_hash,
+    )
     return {
         "hctx": hctx,
         "atoms": atoms,
@@ -180,26 +193,27 @@ def _resolve(state: DecisionRun, deps: PolicyDeps) -> DecisionRun:
     choice = state["compiled"].action_map[action_id]
     parsed = state["response"].parsed
     ctx = state["ctx"]
-    # Bounded memory: validated assessment updates enter the actor's private
-    # belief state and re-appear in later packets as typed assessments — never
-    # as facts, never as raw prose (H-02).
+    # Bounded memory: validated assessment updates are staged, not written —
+    # the engine may still reject the proposal. ``LLMPolicy.commit`` persists
+    # them only once the proposal is accepted; they then re-appear in later
+    # packets as typed assessments — never as facts, never as raw prose (H-02).
     premise_map = state["compiled"].premise_map
-    for u in parsed.get("assessment_updates", []):
-        deps.ledger.put_assessment(
-            AssessmentRecord(
-                actor_id=ctx.actor_id,
-                topic=u["topic"],
-                assessment=u["assessment"],
-                confidence_label=u["confidence_label"],
-                premise_atom_ids=tuple(
-                    premise_map[t].atom_id for t in u["premise_tokens"] if t in premise_map
-                ),
-                accepted_at=ctx.as_of_utc,
-                decision_token=parsed["decision_token"],
-                run_id=ctx.run_id,
-                branch_id=ctx.branch_id,
-            )
+    pending = [
+        AssessmentRecord(
+            actor_id=ctx.actor_id,
+            topic=u["topic"],
+            assessment=u["assessment"],
+            confidence_label=u["confidence_label"],
+            premise_atom_ids=tuple(
+                premise_map[t].atom_id for t in u["premise_tokens"] if t in premise_map
+            ),
+            accepted_at=ctx.as_of_utc,
+            decision_token=parsed["decision_token"],
+            run_id=ctx.run_id,
+            branch_id=ctx.branch_id,
         )
+        for u in parsed.get("assessment_updates", [])
+    ]
     proposal = Proposal(
         kind=choice.kind,
         candidate_id=(choice.target_internal_id if choice.kind == "OPEN" else None),
@@ -214,7 +228,7 @@ def _resolve(state: DecisionRun, deps: PolicyDeps) -> DecisionRun:
         reason_codes=tuple(parsed.get("reason_codes", ())),
         uncertainty_codes=tuple(parsed.get("uncertainty_codes", ("NONE_IDENTIFIED",))),
     )
-    return {"proposal": proposal}
+    return {"proposal": proposal, "pending_assessments": pending}
 
 
 def _manager_allocation(state: DecisionRun) -> dict[str, int]:
@@ -258,8 +272,15 @@ def build_decision_graph(deps: PolicyDeps) -> Any:
     return g.compile(checkpointer=InMemorySaver())
 
 
-def run_decision(deps: PolicyDeps, ctx: DecisionContext) -> tuple[Proposal, dict[str, Any]]:
-    """Execute one decision barrier; raises PolicyError on terminal failure."""
+def run_decision(
+    deps: PolicyDeps, ctx: DecisionContext
+) -> tuple[Proposal, dict[str, Any], list[AssessmentRecord]]:
+    """Execute one decision barrier; raises PolicyError on terminal failure.
+
+    The third return element is the staged assessment writes — persisted by
+    the caller (``LLMPolicy.commit``) only after the engine accepts the
+    proposal, so rejected proposals leave no belief-state trace.
+    """
     graph = build_decision_graph(deps)
     thread = f"{ctx.run_id}:{ctx.branch_id}:{ctx.actor_id}:{ctx.as_of_utc.isoformat()}"
     final = graph.invoke(
@@ -268,4 +289,8 @@ def run_decision(deps: PolicyDeps, ctx: DecisionContext) -> tuple[Proposal, dict
     )
     if final.get("error") or "proposal" not in final:
         raise PolicyError(final.get("error") or "NO_PROPOSAL")
-    return final["proposal"], final.get("witness", {})
+    return (
+        final["proposal"],
+        final.get("witness", {}),
+        final.get("pending_assessments", []),
+    )

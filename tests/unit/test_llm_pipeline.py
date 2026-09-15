@@ -112,7 +112,7 @@ def _deps(
 
 def test_mock_pipeline_wait(tmp_path: Any) -> None:
     deps = _deps(tmp_path)
-    proposal, witness = run_decision(deps, _spread_ctx(with_candidate=False))
+    proposal, witness, _pending = run_decision(deps, _spread_ctx(with_candidate=False))
     assert proposal.kind == "WAIT"
     assert witness["status"] == "ACCEPTED"
     assert witness["parametric_ignorance_proven"] is False
@@ -120,7 +120,7 @@ def test_mock_pipeline_wait(tmp_path: Any) -> None:
 
 def test_mock_pipeline_open(tmp_path: Any) -> None:
     deps = _deps(tmp_path, MockGateway(prefer_kind="OPEN"))
-    proposal, _w = run_decision(deps, _spread_ctx())
+    proposal, _w, _ = run_decision(deps, _spread_ctx())
     assert proposal.kind == "OPEN"
     assert proposal.candidate_id == "cand:1"
     assert proposal.limit_template_id == "entry:cand:1"
@@ -128,7 +128,7 @@ def test_mock_pipeline_open(tmp_path: Any) -> None:
 
 def test_mock_manager_allocate(tmp_path: Any) -> None:
     deps = _deps(tmp_path, MockGateway(prefer_kind="ALLOCATE"))
-    proposal, _ = run_decision(deps, _manager_ctx())
+    proposal, _, _pending = run_decision(deps, _manager_ctx())
     assert proposal.kind == "ALLOCATE"
     assert proposal.allocation == {"bullish": 2, "bearish": 1}
 
@@ -147,7 +147,7 @@ def test_tape_persistence_and_replay(tmp_path: Any) -> None:
         max_retries=2,
         model_id="mock-1",  # type: ignore[arg-type]
     )
-    proposal, _ = run_decision(deps2, _spread_ctx())
+    proposal, _, _pending = run_decision(deps2, _spread_ctx())
     assert proposal.kind == "OPEN"
 
 
@@ -177,7 +177,7 @@ def test_retry_on_invalid_response_then_quarantine(tmp_path: Any) -> None:
             return self.good.complete(req)
 
     deps = _deps(tmp_path, BadThenGood())
-    proposal, _ = run_decision(deps, _spread_ctx(with_candidate=False))
+    proposal, _, _pending = run_decision(deps, _spread_ctx(with_candidate=False))
     assert proposal.kind == "WAIT"
     incidents = deps.ledger.incidents("run-1")
     assert len(incidents) == 1
@@ -225,6 +225,61 @@ def test_llm_policy_adapter(tmp_path: Any) -> None:
     policy = LLMPolicy(deps)
     p = policy.decide(_spread_ctx(with_candidate=False))
     assert p.kind == "WAIT"
+
+
+class _AssessingGateway(MockGateway):
+    """Mock that also proposes one assessment update per decision."""
+
+    def complete(
+        self, req: ModelRequest, system_text: str = "", schema: dict | None = None
+    ) -> ModelResponse:
+        resp = super().complete(req, system_text, schema)
+        tok = req.packet["premises"][0]["token"]
+        parsed = dict(resp.parsed)
+        parsed["assessment_updates"] = [
+            {
+                "topic": "RATE_OUTLOOK",
+                "assessment": "UNCERTAIN",
+                "premise_tokens": [tok],
+                "confidence_label": "LOW",
+            }
+        ]
+        return ModelResponse(
+            resp.request_hash,
+            json.dumps(parsed, sort_keys=True),
+            parsed,
+            resp.model_id,
+            resp.input_tokens,
+            resp.output_tokens,
+            resp.cost_usd,
+        )
+
+
+def test_assessments_staged_until_engine_accepts(tmp_path: Any) -> None:
+    """Validated assessment updates persist only on commit — a proposal the
+    engine rejects leaves no belief-state trace."""
+    deps = _deps(tmp_path, _AssessingGateway())
+    policy = LLMPolicy(deps)
+    ctx = _spread_ctx(with_candidate=False)
+    policy.decide(ctx)
+    assert deps.ledger.assessments("run-1", "main", "a1") == []
+    policy.discard(ctx)
+    assert deps.ledger.assessments("run-1", "main", "a1") == []
+    ctx2 = _spread_ctx(with_candidate=False)
+    ctx2 = DecisionContext(
+        ctx2.run_id,
+        ctx2.branch_id,
+        ctx2.actor_id,
+        ctx2.role,
+        datetime(2024, 1, 2, 15, 30, tzinfo=UTC),
+        ctx2.session_index,
+        60,
+        spread_view=ctx2.spread_view,
+    )
+    policy.decide(ctx2)
+    policy.commit(ctx2)
+    recs = deps.ledger.assessments("run-1", "main", "a1")
+    assert len(recs) == 1 and recs[0].topic == "RATE_OUTLOOK"
 
 
 def test_engine_with_llm_policy_end_to_end(tmp_path: Any) -> None:
@@ -278,6 +333,32 @@ def test_engine_with_llm_policy_end_to_end(tmp_path: Any) -> None:
     witnesses = [e for e in result.events if e.type == "DECISION_WITNESS"]
     assert len(witnesses) == len([e for e in result.events if e.type == "DECISION_MADE"])
     assert all(w.payload["status"] == "ACCEPTED" for w in witnesses)
+    # Real session indices: the relative clock advances across days and
+    # decision identities are unique per (session, barrier).
+    clocks = {r.request["packet"]["clock"]["session_index"] for r in deps.tape._records.values()}
+    assert clocks == {0, 1}
+    mgr = [w for w in witnesses if w.payload["actor_id"] == "manager-1"]
+    assert len(mgr) >= 2
+    assert len({w.payload["private_decision_id"] for w in mgr}) == len(mgr)
+    # Bounded premises: each barrier's packet shows only that barrier's view
+    # atoms — no stale duplicates accumulate across sessions.
+    view_metric_names = (
+        "available_slots",
+        "bull_deficit",
+        "bear_deficit",
+        "direction_target",
+    )
+    for rec in deps.tape._records.values():
+        packet = rec.request["packet"]
+        if packet["actor_role"] != "MANAGER":
+            continue
+        view_metrics = [p["metric"] for p in packet["premises"] if p["metric"] in view_metric_names]
+        assert len(view_metrics) == len(set(view_metrics))
+        assert all(
+            p["age_minutes"] == 0
+            for p in packet["premises"]
+            if p["metric"] in view_metric_names
+        )
 
 
 def test_engine_macro_vintages_reach_manager_only_after_availability(

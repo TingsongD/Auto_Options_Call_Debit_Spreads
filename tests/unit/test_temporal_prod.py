@@ -182,7 +182,9 @@ class TestPacketBoundary:
             led.deliver("run-1", "main", "manager-1", a.atom_id, T0)
         comp = compile_for_actor(led, h, ctx, manager_menu(view, atoms))
         kinds = {m["kind"] for m in comp.public["action_menu"]}
-        assert {"NO_CHANGE", "ALLOCATE", "PAUSE_NEW_ALLOCATIONS", "RESUME_NEW_ALLOCATIONS"} <= kinds
+        assert {"NO_CHANGE", "ALLOCATE", "PAUSE_NEW_ALLOCATIONS"} <= kinds
+        # Feasibility filtering: RESUME is offered only while paused.
+        assert "RESUME_NEW_ALLOCATIONS" not in kinds
 
 
 def _mk_agent() -> object:
@@ -481,3 +483,167 @@ class TestHarnessSemantics:
         led.put_atom(late_atom)
         with pytest.raises(HarnessError, match="DELIVERY_BEFORE_AVAILABILITY"):
             led.deliver("run-1", "main", "manager-1", late_atom.atom_id, T0)
+
+
+class TestPacketSemantics:
+    """W3: bounded premises, true prior belief, assessment cap, feasible menus."""
+
+    def _spread_view(self) -> object:
+        from spx_research.engine.policy import SpreadView
+
+        return SpreadView(_mk_agent(), None, None, None, 0, (), (), ())
+
+    def test_premises_bounded_to_current_barrier(self) -> None:
+        led = InMemoryObservationLedger()
+        h = Harness(KEY)
+        view = self._spread_view()
+        atoms1 = spread_atoms(view, T0)
+        for a in atoms1:
+            led.put_atom(a)
+            led.deliver("run-1", "main", "agent-1", a.atom_id, T0)
+        t1 = T0 + timedelta(minutes=30)
+        atoms2 = spread_atoms(view, t1)
+        for a in atoms2:
+            led.put_atom(a)
+            led.deliver("run-1", "main", "agent-1", a.atom_id, t1)
+        comp = compile_for_actor(
+            led,
+            h,
+            _ctx("agent-1", as_of=t1),
+            spread_menu(view, atoms2),
+            premise_ids={a.atom_id for a in atoms2},
+        )
+        assert len(comp.public["premises"]) == len(atoms2)
+        # Stale atoms stay resolvable (carried assessments still validate) but
+        # are not re-shown as current evidence.
+        assert len(comp.premise_map) == len(atoms1) + len(atoms2)
+        assert all(p["age_minutes"] == 0 for p in comp.public["premises"])
+
+    def test_prior_belief_is_pre_delivery(self) -> None:
+        led = InMemoryObservationLedger()
+        h = Harness(KEY)
+        view = self._spread_view()
+        atoms1 = spread_atoms(view, T0)
+        for a in atoms1:
+            led.put_atom(a)
+            led.deliver("run-1", "main", "agent-1", a.atom_id, T0)
+        t1 = T0 + timedelta(minutes=30)
+        ctx2 = _ctx("agent-1", as_of=t1)
+        prior = reduce_belief(led, h, ctx2)  # computed before barrier-2 atoms land
+        atoms2 = spread_atoms(view, t1)
+        for a in atoms2:
+            led.put_atom(a)
+            led.deliver("run-1", "main", "agent-1", a.atom_id, t1)
+        comp = compile_for_actor(
+            led,
+            h,
+            ctx2,
+            spread_menu(view, atoms2),
+            premise_ids={a.atom_id for a in atoms2},
+            prior_belief_hash=prior.belief_hash,
+        )
+        assert comp.public["prior_belief_token"] == h.token(
+            "run-1:main", "bel", prior.belief_hash
+        )
+        post = reduce_belief(led, h, ctx2)
+        assert comp.public["prior_belief_token"] != h.token(
+            "run-1:main", "bel", post.belief_hash
+        )
+
+    def test_carried_assessments_capped_at_16(self) -> None:
+        led = InMemoryObservationLedger()
+        h = Harness(KEY)
+        a = _obs("policy_rate_bps", "525", T0 - timedelta(hours=2))
+        led.put_atom(a)
+        led.deliver("run-1", "main", "agent-1", a.atom_id, T0 - timedelta(hours=2))
+        for i in range(20):
+            led.put_assessment(
+                AssessmentRecord(
+                    "agent-1",
+                    "RATE_OUTLOOK",
+                    "UNCERTAIN",
+                    "LOW",
+                    (a.atom_id,),
+                    T0 - timedelta(minutes=i),
+                    f"dt-{i}",
+                    run_id="run-1",
+                    branch_id="main",
+                )
+            )
+        belief = reduce_belief(led, h, _ctx("agent-1"))
+        assert len(belief.assessments) == 16
+        # the most recent sixteen survive — the oldest four are dropped
+        oldest_kept = min(r.accepted_at for r in belief.assessments)
+        assert oldest_kept == T0 - timedelta(minutes=15)
+
+    def test_manager_menu_filters_infeasible_actions(self) -> None:
+        from spx_research.engine.policy import ManagerView
+
+        base = dict(
+            as_of_utc=T0,
+            active_bullish=0,
+            active_bearish=0,
+            reserved_bullish=0,
+            reserved_bearish=0,
+            capacity=3,
+            bullish_target=2,
+            bearish_target=1,
+            available_usd=Decimal("10000"),
+            reservations=(),
+        )
+        paused = ManagerView(**{**base, "paused": True})
+        kinds = {m.kind for m in manager_menu(paused, manager_atoms(paused, T0))}
+        assert "RESUME_NEW_ALLOCATIONS" in kinds
+        assert "PAUSE_NEW_ALLOCATIONS" not in kinds
+        assert "ALLOCATE" not in kinds  # no allocation while paused
+
+        met = ManagerView(
+            **{**base, "paused": False, "active_bullish": 2, "active_bearish": 1}
+        )
+        kinds = {m.kind for m in manager_menu(met, manager_atoms(met, T0))}
+        assert "ALLOCATE" not in kinds  # targets met — nothing to allocate
+        assert "NO_CHANGE" in kinds
+
+    def test_close_templates_have_distinct_ids(self) -> None:
+        from spx_research.domain.state import AgentState, Position
+        from spx_research.domain.types import Contract, CreditSpread, Direction, PricePoints, Right
+        from spx_research.engine.policy import LimitTemplate, SpreadView
+
+        leg = lambda s, cid: Contract(  # noqa: E731
+            contract_id=cid,
+            root="SPXW",
+            right=Right.PUT,
+            strike_points=PricePoints(Decimal(s)),
+            expiration_local_date=__import__("datetime").date(2024, 2, 16),
+            exercise_style="EUROPEAN",
+            settlement_style="PM",
+            multiplier=100,
+            price_increment=Decimal("0.05"),
+        )
+        agent = _mk_agent()
+        agent = replace(agent, state=AgentState.OPEN, position_id="pos-1")
+        pos = Position(
+            "pos-1",
+            agent.agent_id,
+            CreditSpread(leg(4700, "s1"), leg(4675, "l1"), Direction.BULL_PUT_CREDIT),
+            Decimal("2"),
+            Decimal("2.6"),
+            T0,
+            __import__("datetime").date(2024, 1, 2),
+            Decimal("2300"),
+        )
+        tpls = (
+            LimitTemplate("exit-natural", "NATURAL", Decimal("1")),
+            LimitTemplate("exit-mid", "MID", Decimal("0.9")),
+        )
+        view = SpreadView(agent, pos, Decimal("1"), Decimal("0.5"), 1, (), (), tpls)
+        atoms = spread_atoms(view, T0)
+        menu = spread_menu(view, atoms)
+        close_ids = [m.internal_id for m in menu if m.kind == "CLOSE"]
+        assert len(close_ids) == 2 and len(set(close_ids)) == 2
+        led = InMemoryObservationLedger()
+        for a in atoms:
+            led.put_atom(a)
+            led.deliver("run-1", "main", agent.agent_id, a.atom_id, T0)
+        comp = compile_for_actor(led, Harness(KEY), _ctx(agent.agent_id), menu)
+        assert len(comp.action_map) == len(menu)  # no DUPLICATE_ACTION collapse

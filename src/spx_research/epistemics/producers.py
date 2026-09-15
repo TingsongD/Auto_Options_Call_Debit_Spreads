@@ -55,17 +55,17 @@ def spread_atoms(view: SpreadView, as_of: datetime) -> list[Atom]:
 
 
 def spread_menu(view: SpreadView, atoms: list[Atom]) -> list[MenuChoice]:
-    slots = atoms[0]  # always present
+    slots = next(a for a in atoms if a.metric == "available_slots")
     menu: list[MenuChoice] = []
     if view.agent.state.name == "SEEKING_ENTRY":
         menu.append(MenuChoice("act-wait", "WAIT", (slots.atom_id,)))
-        risk_by_strike = {a.value: a.atom_id for a in atoms if a.metric == "candidate_max_risk"}
+        risk_atoms = [a for a in atoms if a.metric == "candidate_max_risk"]
         tpl_by_id = {t2.template_id: t2 for t2 in view.entry_limit_templates}
-        for c in view.candidates:
+        for c, risk in zip(view.candidates, risk_atoms, strict=True):
             tpl = tpl_by_id.get(f"entry:{c.candidate_id}")
             if tpl is None:
                 continue
-            req = (slots.atom_id, risk_by_strike[str(c.max_loss_usd)])
+            req = (slots.atom_id, risk.atom_id)
             menu.append(
                 MenuChoice(
                     f"act-open:{c.candidate_id}",
@@ -75,7 +75,7 @@ def spread_menu(view: SpreadView, atoms: list[Atom]) -> list[MenuChoice]:
                     limit_internal_id=tpl.template_id,
                 )
             )
-    else:
+    elif view.position is not None:
         prof = next((a for a in atoms if a.metric == "profit_fraction"), None)
         base = (prof.atom_id,) if prof else (slots.atom_id,)
         menu.append(
@@ -83,16 +83,16 @@ def spread_menu(view: SpreadView, atoms: list[Atom]) -> list[MenuChoice]:
                 "act-hold",
                 "HOLD",
                 base,
-                target_internal_id=(view.position.position_id if view.position else None),
+                target_internal_id=view.position.position_id,
             )
         )
         for tpl in view.exit_limit_templates:
             menu.append(
                 MenuChoice(
-                    "act-close",
+                    f"act-close:{tpl.template_id}",
                     "CLOSE",
                     base,
-                    target_internal_id=(view.position.position_id if view.position else None),
+                    target_internal_id=view.position.position_id,
                     limit_internal_id=tpl.template_id,
                 )
             )
@@ -147,14 +147,24 @@ def manager_atoms(view: ManagerView, as_of: datetime) -> list[Atom]:
 
 
 def manager_menu(view: ManagerView, atoms: list[Atom]) -> list[MenuChoice]:
-    base = tuple(a.atom_id for a in atoms[:1])  # available_slots premise
+    base = (next(a for a in atoms if a.metric == "available_slots").atom_id,)
     menu = [MenuChoice("act-nochange", "NO_CHANGE", base)]
-    deficits = tuple(
-        a.atom_id for a in atoms if a.metric in ("bull_deficit", "bear_deficit", "direction_target")
+    bull_deficit = view.bullish_target - (view.active_bullish + view.reserved_bullish)
+    bear_deficit = view.bearish_target - (view.active_bearish + view.reserved_bearish)
+    free = view.capacity - (
+        view.active_bullish + view.active_bearish + view.reserved_bullish + view.reserved_bearish
     )
-    menu.append(MenuChoice("act-allocate", "ALLOCATE", base + deficits))
-    menu.append(MenuChoice("act-pause", "PAUSE_NEW_ALLOCATIONS", base))
-    menu.append(MenuChoice("act-resume", "RESUME_NEW_ALLOCATIONS", base))
+    if (bull_deficit > 0 or bear_deficit > 0) and free > 0 and not view.paused:
+        deficits = tuple(
+            a.atom_id
+            for a in atoms
+            if a.metric in ("bull_deficit", "bear_deficit", "direction_target")
+        )
+        menu.append(MenuChoice("act-allocate", "ALLOCATE", base + deficits))
+    if not view.paused:
+        menu.append(MenuChoice("act-pause", "PAUSE_NEW_ALLOCATIONS", base))
+    else:
+        menu.append(MenuChoice("act-resume", "RESUME_NEW_ALLOCATIONS", base))
     for r in view.reservations:
         menu.append(
             MenuChoice(
@@ -197,18 +207,32 @@ def compile_for_actor(
     harness: Harness,
     ctx: Context,
     menu: list[MenuChoice],
+    premise_ids: set[str] | None = None,
+    prior_belief_hash: str | None = None,
 ) -> Compiled:
     """Compile + egress-check a blinded packet for one actor.
 
-    The actor's verified belief state supplies the prior-belief hash, carried
-    assessments, and unknowns — local reconstruction, no provider state.
+    The actor's verified belief state supplies carried assessments and
+    unknowns — local reconstruction, no provider state. ``premise_ids``
+    bounds the packet's evidence list to the current barrier's batch (the
+    producers re-emit persistent macro facts each barrier, so they stay
+    visible); ``premise_map`` still covers every delivered atom so carried
+    assessment tokens keep resolving. ``prior_belief_hash`` should be the
+    belief reduced *before* this barrier's deliveries — the caller computes
+    it pre-delivery so the token names the prior state, not the belief the
+    packet itself just created.
     """
     from dataclasses import replace
 
     from spx_research.epistemics.reducer import reduce_belief
 
     belief = reduce_belief(ledger, harness, ctx)
-    ctx2 = replace(ctx, prior_visible_belief_hash=belief.belief_hash)
+    ctx2 = replace(
+        ctx,
+        prior_visible_belief_hash=(
+            prior_belief_hash if prior_belief_hash is not None else belief.belief_hash
+        ),
+    )
     compiled = harness.compile(
         ledger.atoms(),
         ledger.deliveries(ctx2.run_id, ctx2.branch_id, ctx2.actor_id),
@@ -216,6 +240,7 @@ def compile_for_actor(
         menu,
         assessments=belief.assessments,
         unknowns=belief.unknowns,
+        premise_ids=premise_ids,
     )
     egress_check(compiled.public, ctx2)
     return compiled
