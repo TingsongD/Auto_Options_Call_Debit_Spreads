@@ -155,6 +155,25 @@ def run(
     )
     mft = json.loads((dataset_root / "manifest.json").read_text())
     tape_path = tape or (out / "decision_tape.jsonl")
+    if store == "postgres":
+        from spx_research.epistemics.store import ObservationLedger
+        from spx_research.persistence.postgres import PostgresObservationLedger
+
+        dsn = os.environ.get("SPX_DB_DSN")
+        if not dsn:
+            typer.secho("SPX_DB_DSN is not set", fg=typer.colors.RED, err=True)
+            raise typer.Exit(2)
+        pg_engine = create_engine(dsn)
+        event_store: InMemoryEventStore | PostgresEventStore = PostgresEventStore(pg_engine)
+        obs_ledger: ObservationLedger = PostgresObservationLedger(pg_engine)
+    elif store == "memory":
+        from spx_research.epistemics.store import InMemoryObservationLedger, ObservationLedger
+
+        event_store = InMemoryEventStore()
+        obs_ledger = InMemoryObservationLedger()
+    else:
+        typer.secho(f"unknown store {store!r}", fg=typer.colors.RED)
+        raise typer.Exit(2)
     if policy == "mechanical":
         policy_provider = lambda _role: mech  # noqa: E731
     elif policy in ("llm-mock", "llm"):
@@ -169,25 +188,13 @@ def run(
                 price_in=Decimal(price_in_per_mtok) if price_in_per_mtok else None,
                 price_out=Decimal(price_out_per_mtok) if price_out_per_mtok else None,
                 manifest_id=str(mft.get("manifest_id", "local")),
+                ledger=obs_ledger,
             )
         except InvalidOperation:
             typer.secho("invalid decimal in --budget-usd/--price-*", fg=typer.colors.RED, err=True)
             raise typer.Exit(2) from None
     else:
         typer.secho(f"unknown policy {policy!r}", fg=typer.colors.RED, err=True)
-        raise typer.Exit(2)
-    if store == "postgres":
-        dsn = os.environ.get("SPX_DB_DSN")
-        if not dsn:
-            typer.secho("SPX_DB_DSN is not set", fg=typer.colors.RED, err=True)
-            raise typer.Exit(2)
-        event_store: InMemoryEventStore | PostgresEventStore = PostgresEventStore(
-            create_engine(dsn)
-        )
-    elif store == "memory":
-        event_store = InMemoryEventStore()
-    else:
-        typer.secho(f"unknown store {store!r}", fg=typer.colors.RED)
         raise typer.Exit(2)
     engine = Engine(profile, cal, archive, event_store, policy_provider, run_id=run_id)
     result = engine.run(s, e)
@@ -231,6 +238,7 @@ def _llm_policy_provider(
     price_in: Decimal | None,
     price_out: Decimal | None,
     manifest_id: str,
+    ledger: Any,
 ) -> Any:
     """Build a per-role LLMPolicy factory over one shared pipeline (B2).
 
@@ -244,7 +252,6 @@ def _llm_policy_provider(
     from spx_research.agents.llm_policy import LLMPolicy
     from spx_research.contracts import SpecNotFoundError, load_prompt, load_schema
     from spx_research.epistemics.harness import Harness
-    from spx_research.epistemics.store import InMemoryObservationLedger
     from spx_research.llm.tape import DecisionTape
 
     def _fail(msg: str) -> NoReturn:
@@ -302,7 +309,7 @@ def _llm_policy_provider(
     alias_key = hashlib.sha256(f"spx-alias:{manifest_id}:{run_id}".encode()).digest()
     deps = PolicyDeps(
         harness=Harness(alias_key),
-        ledger=InMemoryObservationLedger(),
+        ledger=ledger,
         gateway=gateway,
         tape=DecisionTape(tape_path),
         profile=profile,

@@ -86,6 +86,17 @@ class InMemoryObservationLedger:
             raise HarnessError("DELIVERY_BEFORE_AVAILABILITY")  # fail closed
         if "PUBLIC" not in a.recipients and actor_id not in a.recipients:
             raise HarnessError("WRONG_RECIPIENT")
+        # First-wins: redelivering the same atom to the same recipient returns
+        # the original delivery record (parity with the Postgres ON CONFLICT
+        # path); the unique key is (run, branch, actor, atom).
+        for d in self._deliveries:
+            if (d.run_id, d.branch_id, d.actor_id, d.atom_id) == (
+                run_id,
+                branch_id,
+                actor_id,
+                atom_id,
+            ):
+                return d
         d = Delivery(run_id, branch_id, actor_id, atom_id, at)
         self._deliveries.append(d)
         return d
@@ -99,6 +110,14 @@ class InMemoryObservationLedger:
 
     def put_assessment(self, rec: AssessmentRecord) -> None:
         aware_check(rec.accepted_at)
+        # Idempotent on the natural key — retries/replays re-put the same
+        # record without duplicating rows (parity with Postgres).
+        key = (rec.run_id, rec.branch_id, rec.actor_id, rec.decision_token, rec.topic)
+        if any(
+            (r.run_id, r.branch_id, r.actor_id, r.decision_token, r.topic) == key
+            for r in self._assessments
+        ):
+            return
         self._assessments.append(rec)
 
     def assessments(self, run_id: str, branch_id: str, actor_id: str) -> list[AssessmentRecord]:

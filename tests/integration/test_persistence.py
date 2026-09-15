@@ -110,6 +110,67 @@ def test_observation_ledger_round_trip(pg):
     assert aid in led.atoms()
 
 
+def test_ledger_idempotent_redelivery(pg):
+    """put_atom/deliver/put_assessment must be safe to repeat (barrier retries)."""
+    from spx_research.epistemics.store import AssessmentRecord
+
+    led = PostgresObservationLedger(pg)
+    rid = f"it-{uuid.uuid4().hex[:8]}"
+    aid = f"at-{uuid.uuid4().hex[:8]}"
+    atom = _atom(aid)
+    led.put_atom(atom)
+    led.put_atom(atom)  # same content-addressed atom — must not crash
+    t = datetime(2020, 1, 2, 1, 0, tzinfo=UTC)
+    d1 = led.deliver(rid, "br-1", "agent-1", aid, t)
+    d2 = led.deliver(rid, "br-1", "agent-1", aid, t + __import__("datetime").timedelta(hours=1))
+    assert d1.delivered_at == d2.delivered_at  # first wins
+    assert len(led.deliveries(rid, "br-1", "agent-1")) == 1
+    rec = AssessmentRecord(
+        actor_id="agent-1",
+        topic="rationale",
+        assessment="ok",
+        confidence_label="low",
+        premise_atom_ids=(aid,),
+        accepted_at=t,
+        decision_token="dec_x",
+        run_id=rid,
+        branch_id="br-1",
+    )
+    led.put_assessment(rec)
+    led.put_assessment(rec)
+    assert len(led.assessments(rid, "br-1", "agent-1")) == 1
+
+
+def test_ledger_store_parity(pg):
+    """InMemory and Postgres ledgers agree on the same scripted workload."""
+    from spx_research.epistemics.store import (
+        AssessmentRecord,
+        InMemoryObservationLedger,
+    )
+
+    rid = f"it-{uuid.uuid4().hex[:8]}"
+    aid = f"at-{uuid.uuid4().hex[:8]}"
+    t = datetime(2020, 1, 2, 1, 0, tzinfo=UTC)
+    mem = InMemoryObservationLedger()
+    pg_led = PostgresObservationLedger(pg)
+    atom = _atom(aid)
+    rec = AssessmentRecord(
+        actor_id="a1", topic="t", assessment="x", confidence_label="low",
+        premise_atom_ids=(aid,), accepted_at=t, decision_token="dec_1",
+        run_id=rid, branch_id="b",
+    )
+    for led in (mem, pg_led):
+        led.put_atom(atom)
+        led.put_atom(atom)
+        led.deliver(rid, "b", "a1", aid, t)
+        led.deliver(rid, "b", "a1", aid, t)  # redelivery dedupes
+        led.put_assessment(rec)
+        led.put_assessment(rec)
+    assert len(mem.deliveries(rid, "b", "a1")) == len(pg_led.deliveries(rid, "b", "a1")) == 1
+    assert len(mem.assessments(rid, "b", "a1")) == len(pg_led.assessments(rid, "b", "a1")) == 1
+    assert mem.next_incident_id(rid) == pg_led.next_incident_id(rid)
+
+
 def test_replay_from_postgres_matches_inmemory(pg):
     """Crash recovery: events in Postgres fold to the same state (T40/T41)."""
     from decimal import Decimal

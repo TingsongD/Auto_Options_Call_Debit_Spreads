@@ -149,9 +149,14 @@ class PostgresObservationLedger:
     def put_atom(self, atom: Atom) -> None:
         for t in (atom.published_at, atom.available_at, atom.subject_at):
             aware_check(t)
+        # Atoms are content-addressed: the same atom_id is the same atom, so
+        # re-put (e.g. a macro atom delivered at many barriers) is a no-op.
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+
         with self._engine.begin() as conn:
             conn.execute(
-                S.atoms.insert().values(
+                pg_insert(S.atoms)
+                .values(
                     atom_id=atom.atom_id,
                     metric=atom.metric,
                     value=atom.value,
@@ -165,6 +170,7 @@ class PostgresObservationLedger:
                     dependencies=list(atom.dependencies),
                     transform=atom.transform,
                 )
+                .on_conflict_do_nothing(index_elements=["atom_id"])
             )
 
     def atoms(self) -> dict[str, Atom]:
@@ -191,28 +197,52 @@ class PostgresObservationLedger:
     def deliver(
         self, run_id: str, branch_id: str, actor_id: str, atom_id: str, at: datetime
     ) -> Delivery:
+        """First-wins delivery: re-delivering returns the original record.
+
+        All reads/validates happen inside the scoped transaction so RLS is
+        active for every query and the check-then-insert is atomic.
+        """
         aware_check(at)
-        atoms = self.atoms()
-        a = atoms.get(atom_id)
-        if a is None:
-            raise HarnessError("MISSING_OBSERVATION")
-        if at < a.available_at:
-            raise HarnessError("DELIVERY_BEFORE_AVAILABILITY")
-        if "PUBLIC" not in a.recipients and actor_id not in a.recipients:
-            raise HarnessError("WRONG_RECIPIENT")
-        d = Delivery(run_id, branch_id, actor_id, atom_id, at)
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+
         with self._engine.begin() as conn:
             _scope(conn, run_id)
+            arow = conn.execute(
+                sa.select(
+                    S.atoms.c.available_at,
+                    S.atoms.c.recipients,
+                ).where(S.atoms.c.atom_id == atom_id)
+            ).first()
+            if arow is None:
+                raise HarnessError("MISSING_OBSERVATION")
+            if at < arow.available_at:
+                raise HarnessError("DELIVERY_BEFORE_AVAILABILITY")
+            if "PUBLIC" not in arow.recipients and actor_id not in arow.recipients:
+                raise HarnessError("WRONG_RECIPIENT")
+            existing = conn.execute(
+                sa.select(S.deliveries.c.delivered_at).where(
+                    (S.deliveries.c.run_id == run_id)
+                    & (S.deliveries.c.branch_id == branch_id)
+                    & (S.deliveries.c.actor_id == actor_id)
+                    & (S.deliveries.c.atom_id == atom_id)
+                )
+            ).first()
+            if existing is not None:
+                return Delivery(run_id, branch_id, actor_id, atom_id, existing.delivered_at)
             conn.execute(
-                S.deliveries.insert().values(
+                pg_insert(S.deliveries)
+                .values(
                     run_id=run_id,
                     branch_id=branch_id,
                     actor_id=actor_id,
                     atom_id=atom_id,
                     delivered_at=at,
                 )
+                .on_conflict_do_nothing(
+                    index_elements=["run_id", "branch_id", "actor_id", "atom_id"]
+                )
             )
-        return d
+        return Delivery(run_id, branch_id, actor_id, atom_id, at)
 
     def deliveries(self, run_id: str, branch_id: str, actor_id: str) -> list[Delivery]:
         with self._engine.connect() as conn:
@@ -234,6 +264,17 @@ class PostgresObservationLedger:
             raise LedgerError("ASSESSMENT_RUN_SCOPE_REQUIRED")
         with self._engine.begin() as conn:
             _scope(conn, rec.run_id)
+            exists = conn.execute(
+                sa.select(S.assessments.c.id).where(
+                    (S.assessments.c.run_id == rec.run_id)
+                    & (S.assessments.c.branch_id == rec.branch_id)
+                    & (S.assessments.c.actor_id == rec.actor_id)
+                    & (S.assessments.c.decision_token == rec.decision_token)
+                    & (S.assessments.c.topic == rec.topic)
+                )
+            ).first()
+            if exists is not None:
+                return  # natural-key dedupe: retries/replays are no-ops
             conn.execute(
                 S.assessments.insert().values(
                     run_id=rec.run_id,
