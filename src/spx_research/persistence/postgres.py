@@ -20,13 +20,6 @@ from spx_research.persistence import schema as S
 from spx_research.persistence.events import LedgerError, payload_hash
 
 
-def _chain_hash(payload: str, seq: int) -> str:
-    """Same chaining rule as InMemoryEventStore.tip."""
-    import hashlib
-
-    return hashlib.sha256((payload + str(seq)).encode()).hexdigest()[:24]
-
-
 def _scope(conn: sa.engine.Connection, run_id: str) -> None:
     """Set the RLS run scope for this transaction (no-op for table owners)."""
     conn.execute(sa.text("SELECT set_config('app.run_id', :r, true)"), {"r": run_id})
@@ -52,13 +45,13 @@ class PostgresEventStore:
                 {"r": event.run_id},
             )
             row = conn.execute(
-                sa.select(S.events.c.seq, S.events.c.payload_hash)
+                sa.select(S.events.c.seq, S.events.c.event_hash)
                 .where(S.events.c.run_id == event.run_id)
                 .order_by(S.events.c.seq.desc())
                 .limit(1)
             ).first()
             if row:
-                seq, prev_hash = row.seq, _chain_hash(row.payload_hash, row.seq)
+                seq, prev_hash = row.seq, row.event_hash
             else:
                 seq, prev_hash = 0, "genesis"
             if expected_seq != seq:
@@ -89,6 +82,7 @@ class PostgresEventStore:
                         payload=e.payload,
                         payload_hash=e.payload_hash,
                         previous_hash=e.previous_hash,
+                        event_hash=e.event_hash,
                     )
                 )
             except sa.exc.IntegrityError as exc:
@@ -127,6 +121,7 @@ class PostgresEventStore:
                 payload=dict(r.payload),
                 payload_hash=r.payload_hash,
                 previous_hash=r.previous_hash,
+                event_hash=r.event_hash,
             )
             for r in rows
         ]
@@ -135,14 +130,14 @@ class PostgresEventStore:
         with self._engine.connect() as conn:
             _scope(conn, run_id)
             row = conn.execute(
-                sa.select(S.events.c.seq, S.events.c.payload_hash)
+                sa.select(S.events.c.seq, S.events.c.event_hash)
                 .where(S.events.c.run_id == run_id)
                 .order_by(S.events.c.seq.desc())
                 .limit(1)
             ).first()
         if not row:
             return 0, "genesis"
-        return row.seq, _chain_hash(row.payload_hash, row.seq)
+        return row.seq, row.event_hash
 
 
 class PostgresObservationLedger:

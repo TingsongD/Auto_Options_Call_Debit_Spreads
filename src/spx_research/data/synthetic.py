@@ -52,7 +52,14 @@ def _toy_premium(right: str, strike: Decimal, spot: Decimal, dte: int, rng_bias:
     )
     moneyness = abs(spot - strike) / spot
     decay = max(Decimal("0.02"), Decimal(1) - moneyness * Decimal("4"))
-    return max(Decimal("0.05"), (intrinsic + time_value * decay).quantize(Q))
+    # Convex-in-strike skew so OTM verticals carry realistic nonzero credit
+    # that decays as the pair moves further from spot (take-profit works).
+    if right == "PUT":
+        wing = max(Decimal(0), strike - spot * Decimal("0.9"))
+    else:
+        wing = max(Decimal(0), spot * Decimal("1.1") - strike)
+    skew = Decimal("0.000075") * wing * wing
+    return max(Decimal("0.05"), (intrinsic + time_value * decay + skew).quantize(Q))
 
 
 def _listings(spec: SyntheticSpec, cal: CalendarManifest) -> tuple[dict[str, Any], ...]:

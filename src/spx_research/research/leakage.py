@@ -9,12 +9,12 @@ historical knowledge (parametric_ignorance_proven is always false).
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-from spx_research.domain.state import Event
+from spx_research.domain.state import Event, event_hash
 from spx_research.engine.ledger import replay
 from spx_research.persistence.events import payload_hash
 from spx_research.reporting.report import event_log_digest
@@ -37,24 +37,34 @@ def load_events(path: Path) -> list[Event]:
                 e["payload"],
                 e.get("payload_hash", ""),
                 e.get("previous_hash", ""),
+                e.get("event_hash", ""),
             )
         )
     return out
 
 
 def verify_hash_chain(events: list[Event]) -> bool:
-    """Recompute payload_hash/previous_hash over the committed prefix.
+    """Recompute payload_hash/event_hash/previous_hash over the committed prefix.
 
-    Chaining rule (both stores): previous_hash(e_n) =
-    sha256(payload_hash(e_{n-1}) + str(seq_{n-1}))[:24].
+    Chaining rule (both stores): ``previous_hash(e_n)`` is the prior event's
+    ``event_hash`` (``"genesis"`` for the first), where ``event_hash`` binds
+    run_id, seq, sim_time_utc, phase, type, payload_hash and previous_hash —
+    so envelope tampering (type/time/phase) is detected, not just payload
+    edits.
     """
-    import hashlib
-
     prev = "genesis"
+    expected_seq: int | None = None
     for e in sorted(events, key=lambda x: x.seq):
-        if e.payload_hash != payload_hash(e.payload) or e.previous_hash != prev:
+        if expected_seq is not None and e.seq != expected_seq:
             return False
-        prev = hashlib.sha256((e.payload_hash + str(e.seq)).encode()).hexdigest()[:24]
+        if (
+            e.payload_hash != payload_hash(e.payload)
+            or e.previous_hash != prev
+            or e.event_hash != event_hash(e)
+        ):
+            return False
+        prev = e.event_hash
+        expected_seq = e.seq + 1
     return True
 
 
@@ -68,28 +78,26 @@ def egress_scan_packets(
 ) -> list[dict[str, str]]:
     """Run the egress gate over every public packet on a decision tape.
 
-    Uses the run's real literals (branch, actors, private manifest) so the
-    scan matches the production gate's strength — not a weakened stand-in.
+    Scans against the union of the run's real literals (branch, all actors,
+    private manifest, alias namespace) — equivalent to per-actor contexts but
+    O(lines) instead of O(lines x actors).
     """
-    from spx_research.epistemics.egress import egress_check
-    from spx_research.epistemics.types import Context
+    from spx_research.epistemics.egress import _PATTERNS, _is_numeric, _strings
+    from spx_research.epistemics.harness import canonical
 
     violations: list[dict[str, str]] = []
     if not tape_path.is_file():
         return violations
-    contexts = [
-        Context(
-            run_id=run_id,
-            branch_id=branch_id,
-            actor_id=actor_id,
-            actor_role="",
-            as_of=datetime.now(UTC),
-            session_index=0,
-            minute_from_open=0,
-            alias_namespace=f"{run_id}:{branch_id}" if branch_id else "",
-            private_manifest_id=private_manifest_id,
-        )
-        for actor_id in (actor_ids or ("",))
+    literals = [
+        (lit, name)
+        for lit, name in [
+            (run_id, "RUN_ID"),
+            (branch_id, "BRANCH_ID"),
+            (private_manifest_id, "PRIVATE_MANIFEST"),
+            (f"{run_id}:{branch_id}" if branch_id else "", "ALIAS_NAMESPACE"),
+            *[(a, "ACTOR_ID") for a in actor_ids],
+        ]
+        if lit
     ]
     for line in tape_path.read_text().splitlines():
         if not line.strip():
@@ -101,12 +109,30 @@ def egress_scan_packets(
         packet = rec.get("request", {}).get("packet")
         if packet is None:
             continue
-        for ctx in contexts:
-            try:
-                egress_check(packet, ctx)
-            except Exception as e:  # HarnessError: EGRESS_LEAK:*
-                violations.append({"request_hash": rec.get("request_hash", "?"), "code": str(e)})
+        hit: str | None = None
+        for s in _strings(packet):
+            if not _is_numeric(s):
+                for name, pat in _PATTERNS:
+                    if pat.search(s):
+                        hit = name
+                        break
+            if hit is None:
+                for lit, name in literals:
+                    if lit in s:
+                        hit = name
+                        break
+            if hit is not None:
                 break
+        if hit is None:
+            blob = canonical(packet)
+            for lit, name in literals:
+                if lit.encode() in blob:
+                    hit = name
+                    break
+        if hit is not None:
+            violations.append(
+                {"request_hash": rec.get("request_hash", "?"), "code": f"EGRESS_LEAK:{hit}"}
+            )
     return violations
 
 
@@ -136,6 +162,13 @@ def evaluate_run(
             not report.get("final_cash_usd")
             or Decimal(str(st.account.cash)) == Decimal(str(report["final_cash_usd"]))
         )
+    # The manifest's log digest was computed at write time; recomputing it
+    # over the file on disk catches edits made after the run finished.
+    log_digest = event_log_digest(events) if events else None
+    manifest_digest = manifest.get("event_log_sha256")
+    log_hash_match: bool | None = None
+    if log_digest is not None and manifest_digest:
+        log_hash_match = log_digest == manifest_digest
     if tape_path is None:
         candidate = run_dir / "decision_tape.jsonl"
         tape_path = candidate if candidate.exists() else None
@@ -173,11 +206,12 @@ def evaluate_run(
         "schema_version": "1.0",
         "run_id": run_id,
         "event_count": len(events),
-        "event_log_sha256": event_log_digest(events) if events else None,
+        "event_log_sha256": log_digest,
         "checks": {
             "events_present": bool(events),
             "hash_chain_ok": verify_hash_chain(events) if events else None,
             "replay_ok": replay_ok,
+            "log_hash_match": log_hash_match,
             "egress_violations": violations,
         },
         "classification": STUDY_LABEL,
@@ -211,12 +245,50 @@ def compare_runs(dir_a: Path, dir_b: Path) -> dict[str, Any]:
     }
 
 
+_TOKEN_RE = None  # lazily compiled
+_SCRUB_KEYS = frozenset(
+    {
+        # Key-derived (HMAC) values differ across run ids even when behavior
+        # is identical — they are identity material, not behavior.
+        "private_decision_id",
+        "decision_token",
+        "packet_token",
+        "prior_belief_token",
+        "episode_token",
+        "packet_hash",
+        "prior_belief_hash",
+        "proposal_hash",
+        "belief_hash",
+    }
+)
+
+
+def _scrub(value: Any) -> Any:
+    """Replace key-derived tokens/hashes with placeholders, recursively."""
+    global _TOKEN_RE
+    if _TOKEN_RE is None:
+        import re
+
+        _TOKEN_RE = re.compile(r"^(dec|pkt|ep|as|act|ev|tgt|lim)_[0-9a-f]{12,}$")
+    if isinstance(value, dict):
+        return {
+            k: ("<KEYED>" if k in _SCRUB_KEYS else _scrub(v)) for k, v in value.items()
+        }
+    if isinstance(value, list):
+        return [_scrub(v) for v in value]
+    if isinstance(value, str) and _TOKEN_RE.match(value):
+        return "<TOK>"
+    return value
+
+
 def _normalized_digest(events: list[Event]) -> str | None:
-    """Event digest with the run's own run_id scrubbed.
+    """Event digest with run-scoped identity material scrubbed.
 
     ``run_id`` appears in the envelope and inside payloads (incident ids,
-    witnesses); identical *behavior* under different run ids must compare
-    equal. Hash-chain fields are excluded — they are verified separately by
+    witnesses); HMAC-derived tokens and the packet/belief/proposal hashes
+    that embed them also differ across run ids under identical *behavior*.
+    All are normalized so the digest compares behavior only. Hash-chain
+    envelope fields are excluded — they are verified separately by
     ``verify_hash_chain``.
     """
     import hashlib
@@ -231,7 +303,7 @@ def _normalized_digest(events: list[Event]) -> str | None:
                 "sim_time_utc": e.sim_time_utc.isoformat(),
                 "phase": e.phase,
                 "type": e.type,
-                "payload": e.payload,
+                "payload": _scrub(e.payload),
             },
             sort_keys=True,
             default=str,

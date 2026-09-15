@@ -33,6 +33,7 @@ events = sa.Table(
     sa.Column("payload", sa.JSON, nullable=False),
     sa.Column("payload_hash", sa.Text, nullable=False),
     sa.Column("previous_hash", sa.Text, nullable=False),
+    sa.Column("event_hash", sa.Text, nullable=False),
     sa.PrimaryKeyConstraint("run_id", "seq"),
 )
 

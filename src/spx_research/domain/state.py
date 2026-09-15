@@ -7,6 +7,8 @@ are aware UTC.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
@@ -127,9 +129,10 @@ class Event:
     payload: dict[str, Any]
     payload_hash: str = ""
     previous_hash: str = ""
+    event_hash: str = ""
 
     def with_hashes(self, payload_hash: str, previous_hash: str) -> Event:
-        return Event(
+        linked = Event(
             self.run_id,
             self.seq,
             self.sim_time_utc,
@@ -139,3 +142,36 @@ class Event:
             payload_hash,
             previous_hash,
         )
+        return Event(
+            linked.run_id,
+            linked.seq,
+            linked.sim_time_utc,
+            linked.phase,
+            linked.type,
+            linked.payload,
+            linked.payload_hash,
+            linked.previous_hash,
+            event_hash(linked),
+        )
+
+
+def event_hash(e: Event) -> str:
+    """Canonical digest binding the full envelope + payload + chain link.
+
+    Covers every field a tamperer could flip to change replay semantics:
+    run_id, seq, sim_time_utc, phase, type, payload_hash and previous_hash.
+    """
+    blob = json.dumps(
+        {
+            "run_id": e.run_id,
+            "seq": e.seq,
+            "sim_time_utc": e.sim_time_utc.isoformat(),
+            "phase": e.phase,
+            "type": e.type,
+            "payload_hash": e.payload_hash,
+            "previous_hash": e.previous_hash,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return hashlib.sha256(blob).hexdigest()

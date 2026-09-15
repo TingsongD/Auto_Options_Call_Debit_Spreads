@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import asdict
-from datetime import date, datetime
+from datetime import date
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Annotated, Any, NoReturn
@@ -348,37 +348,33 @@ def migrate() -> None:
 @app.command()
 def replay(
     events_path: Annotated[Path, typer.Argument(help="events.jsonl from a run")],
-    initial_cash: Annotated[str, typer.Option()] = "10000",
+    initial_cash: Annotated[
+        str | None, typer.Option(help="override; defaults to RUN_STARTED payload")
+    ] = None,
 ) -> None:
-    """Fold a committed event log; verifies hash chain. No model calls (M3-05)."""
-    from spx_research.domain.state import Event
+    """Fold a committed event log; verifies the envelope hash chain first (M3-05)."""
     from spx_research.reporting.report import replay_summary
+    from spx_research.research.leakage import load_events, verify_hash_chain
 
-    events = [
-        Event(
-            e["run_id"],
-            e["seq"],
-            _parse_dt(e["sim_time_utc"]),
-            e["phase"],
-            e["type"],
-            e["payload"],
-            e["payload_hash"],
-            e["previous_hash"],
+    events = load_events(events_path)
+    if not events:
+        typer.secho("no events in log", fg=typer.colors.RED, err=True)
+        raise typer.Exit(2)
+    if not verify_hash_chain(events):
+        typer.secho(
+            "FAIL: hash chain verification failed — log is corrupted or tampered",
+            fg=typer.colors.RED,
+            err=True,
         )
-        for e in (json.loads(line) for line in events_path.read_text().splitlines() if line.strip())
-    ]
-    run_id = events[0].run_id if events else "unknown"
-    st, digest = replay_summary(run_id, Decimal(initial_cash), events)
+        raise typer.Exit(1)
+    if initial_cash is None:
+        started = next((e for e in events if e.type == "RUN_STARTED"), None)
+        initial_cash = str(started.payload["initial_cash_usd"]) if started else "10000"
+    st, digest = replay_summary(events[0].run_id, Decimal(initial_cash), events)
     typer.secho(
         f"OK: {len(events)} events folded; cash={st.account.cash}; log={digest[:16]}…",
         fg=typer.colors.GREEN,
     )
-
-
-def _parse_dt(v: str) -> datetime:
-    from datetime import datetime
-
-    return datetime.fromisoformat(v)
 
 
 @app.command()
@@ -398,13 +394,19 @@ def leakage_eval(
     if control_dir is not None:
         report["invariance"] = compare_runs(run_dir, control_dir)
     out_path = out or (run_dir / "leakage_report.json")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(report, indent=2, sort_keys=True))
-    ok = report["checks"]["hash_chain_ok"] and report["checks"]["replay_ok"]
-    n_egress = len(report["checks"]["egress_violations"])
+    checks = report["checks"]
+    ok = bool(
+        checks["hash_chain_ok"]
+        and checks["replay_ok"]
+        and checks.get("log_hash_match") is not False
+    )
+    n_egress = len(checks["egress_violations"])
     typer.secho(
-        f"{'OK' if ok and not n_egress else 'FAIL'}: hash_chain={report['checks']['hash_chain_ok']}"
-        f" replay={report['checks']['replay_ok']} egress_violations={n_egress}"
-        f" -> {out_path}",
+        f"{'OK' if ok and not n_egress else 'FAIL'}: hash_chain={checks['hash_chain_ok']}"
+        f" replay={checks['replay_ok']} log_hash_match={checks.get('log_hash_match')}"
+        f" egress_violations={n_egress} -> {out_path}",
         fg=typer.colors.GREEN if ok and not n_egress else typer.colors.RED,
     )
     if not (ok and not n_egress):

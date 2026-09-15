@@ -32,6 +32,7 @@ class Archive:
             raise AvailabilityError(f"no manifest.json under {self.root}")
         self._con = duckdb.connect(database=":memory:")
         self._quotes_key: str | None = None
+        self._static: set[str] = set()
 
     def _ensure_session_quotes(self, as_of: datetime) -> bool:
         """Materialize the NY session's quote partition into an in-memory table.
@@ -51,20 +52,39 @@ class Archive:
             self._quotes_key = path.name
         return True
 
+    def _ensure_static(self, name: str, glob: str) -> bool:
+        """Materialize a small parquet file/glob into ``_<name>`` once.
+
+        Filtered direct parquet scans hit the same DuckDB PlainSkip row-group
+        limitation as quotes once files grow past one row group; the small
+        reference tables (contracts, greeks, macro, settlements, index) are
+        cheap to materialize in full.
+        """
+        if name in self._static:
+            return True
+        if not list(self.root.glob(glob)):
+            return False
+        self._con.execute(f"CREATE TABLE _{name} AS SELECT * FROM '{self.root}/{glob}'")
+        self._static.add(name)
+        return True
+
     def _q(self, sql: str, params: list[Any] | None = None) -> list[dict[str, Any]]:
         cur = self._con.execute(sql, params or [])
         cols = [d[0] for d in cur.description]
         return [dict(zip(cols, r, strict=True)) for r in cur.fetchall()]
 
     def contracts(self) -> list[dict[str, Any]]:
-        return self._q(f"SELECT * FROM '{self.root}/meta/contracts.parquet'")
+        if not self._ensure_static("contracts", "meta/contracts.parquet"):
+            return []
+        return self._q("SELECT * FROM _contracts")
 
     def contracts_visible_at(self, as_of: datetime) -> list[dict[str, Any]]:
         """Contracts whose first verified observation exists by as_of (T04)."""
         as_of = require_aware(as_of)
+        if not self._ensure_static("contracts", "meta/contracts.parquet"):
+            return []
         return self._q(
-            f"SELECT * FROM '{self.root}/meta/contracts.parquet' "
-            "WHERE first_verified_observation_utc <= ?",
+            "SELECT * FROM _contracts WHERE first_verified_observation_utc <= ?",
             [as_of],
         )
 
@@ -106,8 +126,10 @@ class Archive:
 
     def index_at(self, as_of: datetime) -> dict[str, Any] | None:
         as_of = require_aware(as_of)
+        if not self._ensure_static("index", "quotes/index=*.parquet"):
+            return None
         rows = self._q(
-            f"SELECT * FROM '{self.root}/quotes/index=*.parquet' "
+            "SELECT * FROM _index "
             "WHERE simulated_available_at_utc <= ? ORDER BY observed_at_utc DESC LIMIT 1",
             [as_of],
         )
@@ -115,11 +137,10 @@ class Archive:
 
     def greeks_at(self, contract_id: str, as_of: datetime) -> dict[str, Any] | None:
         as_of = require_aware(as_of)
-        gpath = self.root / "meta" / "greeks.parquet"
-        if not gpath.is_file():
+        if not self._ensure_static("greeks", "meta/greeks.parquet"):
             return None
         rows = self._q(
-            f"SELECT * FROM '{gpath}' WHERE contract_id = ? "
+            "SELECT * FROM _greeks WHERE contract_id = ? "
             "AND simulated_available_at_utc <= ? ORDER BY asof_utc DESC LIMIT 1",
             [contract_id, as_of],
         )
@@ -130,11 +151,10 @@ class Archive:
     ) -> list[dict[str, Any]]:
         """Macro rows whose availability time has passed (T08-T12, TK02/TK05)."""
         as_of = require_aware(as_of)
-        mpath = self.root / "macro" / "vintages.parquet"
-        if not mpath.is_file():
+        if not self._ensure_static("macro", "macro/vintages.parquet"):
             return []
         sql = (
-            f"SELECT * FROM '{mpath}' WHERE simulated_available_at_utc <= ?"
+            "SELECT * FROM _macro WHERE simulated_available_at_utc <= ?"
             + (" AND series_id = ?" if series_id else "")
             + " ORDER BY simulated_available_at_utc"
         )
@@ -142,10 +162,11 @@ class Archive:
         return self._q(sql, params)
 
     def settlement_for(self, expiry: Any) -> dict[str, Any] | None:
-        spath = self.root / "meta" / "settlements.parquet"
-        if not spath.is_file():
+        if not self._ensure_static("settlements", "meta/settlements.parquet"):
             return None
-        rows = self._q(f"SELECT * FROM '{spath}' WHERE expiry_local_date = ? LIMIT 1", [expiry])
+        rows = self._q(
+            "SELECT * FROM _settlements WHERE expiry_local_date = ? LIMIT 1", [expiry]
+        )
         return rows[0] if rows else None
 
     def close(self) -> None:

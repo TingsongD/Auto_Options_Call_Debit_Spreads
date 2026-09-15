@@ -1,8 +1,10 @@
 """Event store: append-only, hash-chained ledger authority.
 
 The in-memory implementation is used by unit/golden tests and replay; the
-PostgreSQL implementation (same protocol) arrives with the persistence
-milestone. Sequence and hash integrity make a corrupted prefix detectable.
+PostgreSQL implementation (same protocol) is the durable store. The chain
+link is the prior event's ``event_hash`` — a digest over the full envelope
+(run_id, seq, sim_time_utc, phase, type) plus ``payload_hash`` and
+``previous_hash`` — so sequence and content tampering are both detectable.
 """
 
 from __future__ import annotations
@@ -54,6 +56,4 @@ class InMemoryEventStore:
         if not events:
             return 0, "genesis"
         last = events[-1]
-        return last.seq, hashlib.sha256((last.payload_hash + str(last.seq)).encode()).hexdigest()[
-            :24
-        ]
+        return last.seq, last.event_hash
