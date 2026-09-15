@@ -25,12 +25,13 @@ against real data or real models. Present surface:
 - `llm/`, `agents/`: gateway protocol (mock/tape/gated OpenAI), decision
   tape, budget ledger, LangGraph decision barrier, `LLMPolicy` adapter.
 - `persistence/`: Postgres event store (advisory-lock single-writer,
-  hash-chained, transactional outbox) + observation ledger; Alembic migration
-  0001 with `spx_engine`/`spx_inference` roles and per-run RLS.
+  hash-chained, transactional outbox) + observation ledger; Alembic
+  migrations 0001–0003 with `spx_engine`/`spx_inference` roles and per-run RLS.
 - `research/`: experiment registry (content-addressed lineage), leakage
   evaluator (hash-chain, replay, tape egress scan, run-comparison probe).
 - `cli/main.py`: `validate-config`, `generate-synthetic`, `run`
-  (`--store memory|postgres`), `replay`, `migrate`, `leakage-eval`,
+  (`--store memory|postgres`, `--policy mechanical|llm-mock|llm`, `--tape`,
+  `--model`, `--budget-usd`), `replay`, `migrate`, `leakage-eval`,
   `register-run`.
 
 ## Verify

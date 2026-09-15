@@ -99,13 +99,20 @@ def egress_scan_packets(
         ]
         if lit
     ]
-    for line in tape_path.read_text().splitlines():
+    lines = tape_path.read_text().splitlines()
+    last_idx = len(lines) - 1
+    for idx, line in enumerate(lines):
         if not line.strip():
             continue
         try:
             rec = json.loads(line)
         except json.JSONDecodeError:
-            continue  # torn tail — same tolerance as DecisionTape
+            # A torn final line is tolerated (same as DecisionTape's append
+            # semantics); an unparseable line anywhere else means the tape
+            # was corrupted mid-file — a finding, not a skip.
+            if idx != last_idx:
+                violations.append({"request_hash": "?", "code": "TAPE_TORN"})
+            continue
         packet = rec.get("request", {}).get("packet")
         if packet is None:
             continue
@@ -170,7 +177,8 @@ def evaluate_run(
     if log_digest is not None and manifest_digest:
         log_hash_match = log_digest == manifest_digest
     if tape_path is None:
-        candidate = run_dir / "decision_tape.jsonl"
+        declared = manifest.get("tape_path")
+        candidate = Path(declared) if declared else run_dir / "decision_tape.jsonl"
         tape_path = candidate if candidate.exists() else None
     branch_id = manifest.get("branch_id") or ""
     if not branch_id and events:

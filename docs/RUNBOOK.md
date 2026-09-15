@@ -12,15 +12,19 @@ authority; checkpoints and reports are projections.
   `postgresql+psycopg://spx_dev:spx_dev_local_only@127.0.0.1:5433/spx_research`.
 - `uv run spx-research migrate` — apply Alembic migrations.
 - `uv run spx-research run profile.yaml --dataset-root ds --out out/run-1
-  --store postgres` — durable run.
+  --store postgres` — durable run: events land in the `events` table and the
+  observation ledger (atoms/deliveries/assessments/incidents) lands in
+  Postgres too — writes are idempotent so barrier retries are safe.
 
 ## Recovery
 
 1. **Crash mid-run**: the committed prefix is authoritative. Read
    `SELECT * FROM events WHERE run_id = :r ORDER BY seq` or
    `events.jsonl`, then `uv run spx-research replay out/run-1/events.jsonl`.
-   Replay must reproduce the same final cash/reserves — a mismatch means the
-   log was corrupted (verify `payload_hash`/`previous_hash` chain).
+   Replay verifies the `event_hash`/`previous_hash` chain over the full
+   envelope (type, phase, sim_time, run_id) before folding; then run
+   `uv run spx-research leakage-eval out/run-1` — its `hash_chain_ok` and
+   `log_hash_match` checks catch post-hoc edits to `events.jsonl`.
 2. **Sequence conflict** (`SEQUENCE_MISMATCH`): another writer holds the run
    or a retry raced. The advisory lock serializes writers; a stale
    `expected_seq` means the caller's tip is old — reload events and retry.

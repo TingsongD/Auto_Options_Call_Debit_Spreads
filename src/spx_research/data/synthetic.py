@@ -10,7 +10,7 @@ never strategy evidence.
 from __future__ import annotations
 
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -227,7 +227,7 @@ def generate(root: Path, spec: SyntheticSpec, cal: CalendarManifest) -> DataMani
         files.append(file_record(ds, spath, len(settle_rows)))
 
     manifest = DataManifest(
-        manifest_id=f"syn-{spec.dataset_id}",  # deterministic id from dataset spec
+        manifest_id="",  # filled below: content-addressed, not the spec name
         dataset_kind="synthetic",
         provider="synthetic",
         adapter_version="synthetic-1",
@@ -239,6 +239,9 @@ def generate(root: Path, spec: SyntheticSpec, cal: CalendarManifest) -> DataMani
         normalized_files=tuple(files),
         calendar_manifest_id=cal.calendar_id,
     )
+    # Content-addressed: two datasets with the same spec name but different
+    # seeds/content get different manifest ids (registry dedupe key).
+    manifest = replace(manifest, manifest_id=f"syn-{manifest.content_id()[4:]}")
     write_manifest(ds, manifest)
     return manifest
 

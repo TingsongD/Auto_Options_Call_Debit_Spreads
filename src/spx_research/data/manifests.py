@@ -50,6 +50,7 @@ class DataManifest:
         """Deterministic manifest content hash over files and parameters."""
         payload = asdict(self)
         payload.pop("created_at_utc", None)  # operational timestamp excluded
+        payload.pop("manifest_id", None)  # identity is derived from content
         blob = json.dumps(payload, sort_keys=True, default=str).encode()
         return "mft_" + hashlib.sha256(blob).hexdigest()[:24]
 

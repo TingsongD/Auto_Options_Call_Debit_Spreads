@@ -216,6 +216,7 @@ def run(
                     "private_manifest_id": (
                         str(mft.get("manifest_id", "local")) if policy != "mechanical" else ""
                     ),
+                    "tape_path": str(tape_path) if policy != "mechanical" else None,
                     "policy_meta": getattr(policy_provider, "meta", {}),
                 },
             ),

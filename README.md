@@ -15,15 +15,15 @@ unchecked — this codebase is a tested scaffold, not an approved system.
 
 `src/spx_research/` follows the spec's target decomposition: `domain`, `data`,
 `temporal`, `epistemics` (the ported temporal-knowledge-harness seed),
-`blinding`, `isolation`, `leakage`, `features`, `engine`, `agents`, `llm`,
-`persistence`, `research`, `cli`, `dashboard`. Tests live in
+`features`, `engine`, `agents`, `llm`, `persistence`, `reporting`, `research`,
+`cli`, `dashboard`. Tests live in
 `tests/{unit,property,integration,golden,fault_injection}`.
 
 ## Commands
 
 ```bash
 uv sync            # create/update .venv from uv.lock (Python 3.12)
-uv run pytest      # unit + property tests (synthetic only, no network)
+uv run pytest      # unit + property + integration tests (synthetic only, no network)
 uv run ruff check  # lint
 uv run mypy src    # type check
 ```

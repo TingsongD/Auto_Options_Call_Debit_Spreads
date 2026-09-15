@@ -37,7 +37,9 @@ def test_manifest_and_files(dataset):
     root, manifest, _ = dataset
     assert (root / "manifest.json").is_file()
     disk = json.loads((root / "manifest.json").read_text())
-    assert disk["manifest_id"] == "syn-t1"
+    # Content-addressed: syn-<content hash>, not the spec's dataset_id.
+    assert disk["manifest_id"].startswith("syn-")
+    assert disk["manifest_id"] == f"syn-{manifest.content_id()[4:]}"
     assert manifest.dataset_kind == "synthetic"
     assert len(manifest.normalized_files) >= 4  # contracts + per-session + greeks + macro
 
@@ -127,3 +129,22 @@ def test_manifest_content_id_stable(dataset):
     assert manifest.content_id() == manifest.content_id()
     other = DataManifest(**{**manifest.__dict__, "provider": "other"})
     assert other.content_id() != manifest.content_id()
+
+
+def test_manifest_id_is_content_addressed(dataset, tmp_path):
+    """Same dataset name + different seed must produce a different manifest id
+    (dataset_manifest_id is the experiment-registry dedupe key)."""
+    _, manifest, cal = dataset
+    spec = SyntheticSpec(
+        dataset_id="t1",  # same name, different seed → different identity
+        seed=43,
+        start=date(2019, 1, 2),
+        end=date(2019, 1, 4),
+        expiries=(date(2019, 2, 15), date(2019, 2, 22)),
+        strikes_each_side=4,
+    )
+    m2 = generate(tmp_path, spec, cal)
+    assert m2.manifest_id != manifest.manifest_id
+    # Same seed again → identical content → identical manifest id.
+    m3 = generate(tmp_path / "again", spec, cal)
+    assert m3.manifest_id == m2.manifest_id
