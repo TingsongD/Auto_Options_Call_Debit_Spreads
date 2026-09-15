@@ -134,7 +134,9 @@ def generate(root: Path, spec: SyntheticSpec, cal: CalendarManifest) -> DataMani
                     mid = _toy_premium(
                         c["right"], Decimal(str(c["strike_points"])), spot, dte, rng.gauss(0, 0.02)
                     )
-                    half = Decimal("0.10")
+                    # Tight synthetic spread: ~2% of typical OTM premium so that
+                    # far-OTM verticals still carry small positive package credit.
+                    half = Decimal("0.02")
                     quote_rows.append(
                         {
                             "contract_id": c["contract_id"],

@@ -10,10 +10,13 @@ from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import duckdb
 
 from spx_research.domain.types import require_aware
+
+NY = ZoneInfo("America/New_York")
 
 
 class AvailabilityError(ValueError):
@@ -28,6 +31,25 @@ class Archive:
         if not (self.root / "manifest.json").is_file():
             raise AvailabilityError(f"no manifest.json under {self.root}")
         self._con = duckdb.connect(database=":memory:")
+        self._quotes_key: str | None = None
+
+    def _ensure_session_quotes(self, as_of: datetime) -> bool:
+        """Materialize the NY session's quote partition into an in-memory table.
+
+        One load per simulated session avoids repeated parquet scans and a
+        DuckDB row-group-skip limitation on nested columns (PlainSkip).
+        """
+        path = self._session_quotes_path(as_of)
+        if not path.is_file():
+            if self._quotes_key is not None:
+                self._con.execute("DROP TABLE IF EXISTS _quotes")
+                self._quotes_key = None
+            return False
+        if self._quotes_key != path.name:
+            self._con.execute("DROP TABLE IF EXISTS _quotes")
+            self._con.execute(f"CREATE TABLE _quotes AS SELECT * FROM '{path}'")
+            self._quotes_key = path.name
+        return True
 
     def _q(self, sql: str, params: list[Any] | None = None) -> list[dict[str, Any]]:
         cur = self._con.execute(sql, params or [])
@@ -46,19 +68,41 @@ class Archive:
             [as_of],
         )
 
+    def _session_quotes_path(self, as_of: datetime) -> Path:
+        """Partition for the NY session containing ``as_of`` (no overnight fill)."""
+        ny_day = as_of.astimezone(NY).date()
+        return self.root / "quotes" / f"session={ny_day.isoformat()}.parquet"
+
     def quote_at(self, contract_id: str, as_of: datetime) -> dict[str, Any] | None:
-        """Latest quote snapshot usable at as_of, or None (T29/T31)."""
+        """Latest usable quote from as_of's own session, or None (T29/T31)."""
         as_of = require_aware(as_of)
+        if not self._ensure_session_quotes(as_of):
+            return None
         rows = self._q(
-            f"SELECT * FROM '{self.root}/quotes/session=*.parquet' "
+            "SELECT * FROM _quotes "
             "WHERE contract_id = ? AND simulated_available_at_utc <= ? "
             "ORDER BY snapshot_at_utc DESC LIMIT 1",
             [contract_id, as_of],
         )
         return rows[0] if rows else None
 
+    def session_quotes(self, contract_ids: list[str], as_of: datetime) -> dict[str, dict[str, Any]]:
+        """Latest usable same-session quote per contract, batched."""
+        as_of = require_aware(as_of)
+        if not self._ensure_session_quotes(as_of) or not contract_ids:
+            return {}
+        marks = ",".join("?" for _ in contract_ids)
+        rows = self._q(
+            f"SELECT * FROM _quotes WHERE contract_id IN ({marks}) "
+            "AND simulated_available_at_utc <= ? "
+            "QUALIFY row_number() OVER (PARTITION BY contract_id "
+            "ORDER BY snapshot_at_utc DESC) = 1",
+            [*contract_ids, as_of],
+        )
+        return {r["contract_id"]: r for r in rows}
+
     def quotes_at(self, contract_ids: list[str], as_of: datetime) -> dict[str, dict[str, Any]]:
-        return {cid: q for cid in contract_ids if (q := self.quote_at(cid, as_of)) is not None}
+        return self.session_quotes(contract_ids, as_of)
 
     def index_at(self, as_of: datetime) -> dict[str, Any] | None:
         as_of = require_aware(as_of)
