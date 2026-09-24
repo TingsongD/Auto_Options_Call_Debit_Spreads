@@ -4,6 +4,19 @@ This log records completed work, its verification, and remaining boundaries.
 Entries describe changes made in the workspace; they do not imply a release,
 commit, hosted CI result, deployment, or owner approval.
 
+## 2026-09-24 — Research goal and UserHarness clarification
+
+- Added the discretionary AI trading research question to the README and user guide.
+- Explained the UserHarness-inspired observation/belief boundary, blinding,
+  external validation, isolation and future-change controls, with a paper link.
+- Distinguished application input isolation from erasing pretrained knowledge,
+  including how a model could recognize an episode while citing valid evidence.
+- Clarified that the AI retains discretion among allowed actions, profitability
+  remains unproven, and real-model residual-leakage measurements remain unperformed.
+- Linked the explanation from the operations runbook and retained conservative
+  reporting labels. Checked documentation links, anchors and whitespace; no
+  application behavior changed and no model calls or service tests were run.
+
 ## 2026-09-24 — Documentation and user onboarding
 
 - Reviewed the existing README, operations runbook, acceptance matrix and

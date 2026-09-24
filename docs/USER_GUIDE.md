@@ -5,6 +5,66 @@ The supported starting point is generated synthetic data with a mechanical or
 mock policy. It does not connect to a broker. Historical ingestion and paid
 experiments remain gated by the [decision register](DECISION_REGISTER.md).
 
+## Historical blinding and pretrained knowledge
+
+The research question is whether an AI can make discretionary spread-trading
+decisions using information available at the time, under a simulated "fog of
+war," and produce consistent profits after costs. At each scheduled decision
+point it makes a judgment call from the actions available to its role: allocate,
+enter, hold, exit or wait. The engine controls execution, capital and accounting;
+the harness constrains evidence and permissible actions without supplying the
+trading answer. Profitable AI trading has not yet been demonstrated by this project.
+
+### What we adopted from UserHarness
+
+[UserHarness: Harnessing User Minds for Stronger Agent Theory-of-Mind](https://arxiv.org/html/2605.27721v1)
+separates the true world state from an actor's observations, maintains that actor's
+beliefs and checks candidate answers against the actor's perspective. Section 3
+describes an inference-time framework that does not train or modify the tested
+model. Its experiments evaluate Theory-of-Mind reasoning, not historical trading
+or removal of pretrained market knowledge.
+
+Our Temporal Knowledge Harness is a project-specific adaptation of those ideas.
+It is not an official UserHarness library; its trading controls are our engineering design.
+The adaptation strengthens historical blinding through these implemented controls:
+
+| Control | What it checks or restricts |
+|---|---|
+| Time-filtered, actor-scoped observations | Only information available and delivered by the decision time enters the actor's packet. |
+| Controlled belief updates | Recorded assessments must refer to permitted evidence and pass scope/lineage checks. |
+| Blinded packets | Relative times and opaque identifiers replace actual dates and contract identities. |
+| External validation and isolated inference | The trusted engine validates proposals; the Docker worker cannot access the historical archive. |
+| Future-change controls | Changing hidden future data must leave earlier complete model requests unchanged. |
+
+### What this does not establish
+
+These controls govern the information the application supplies. They do not
+delete facts already embedded in pretrained model weights, and a valid evidence
+citation cannot prove what internally caused a model's choice.
+
+For example, a model might recognize a distinctive market episode from otherwise
+legitimate observations and remember its later outcome. It could then choose an
+allowed action while citing permitted evidence. The validator can establish that
+the proposal is admissible; it cannot establish that historical memory played no
+part in the judgment. This is a possible failure mode, not a measured finding
+from this project's mock tests.
+
+The accurate claim is: **we implemented stronger information isolation and
+constraints intended to reduce hindsight influence; we have not erased pretrained
+knowledge or measured the residual influence in real-model experiments.**
+
+Passing synthetic tests supports the checked software boundary, conditional on
+correct data timestamps and configuration. It does not establish profitability,
+zero behavioral leakage or model ignorance of historical outcomes. Future
+approved research should separately evaluate behavioral leakage and performance,
+with documented model provenance and prospective decisions recorded before their
+outcomes occur. General financial knowledge remains useful; the concern is access
+to the particular future outcomes the backtest is meant to hide.
+
+Reports preserve this distinction with `model_temporal_provenance=UNKNOWN`,
+`parametric_future_knowledge_excluded=false`, and `NOT_RUN` for unperformed
+diagnostics. Read an audit `PASS` as success for its listed checks only.
+
 ## 1. Install and choose a workspace
 
 Use Python 3.12 and `uv`. Run the following commands from the `app/` directory:

@@ -11,6 +11,23 @@ clear.
 `_pending_` and the vendor data-rights probe (`docs/DATA_RIGHTS_PROBE.md`) is
 unchecked — this codebase is a tested scaffold, not an approved system.
 
+## Research goal and historical blinding
+
+The goal is to test whether an AI can make discretionary option-spread decisions
+from information available at each decision time and earn consistent profits
+after trading costs. Profitability is the hypothesis to investigate, not an
+established result of this implementation.
+
+We adapted ideas from [UserHarness](https://arxiv.org/html/2605.27721v1) to
+strengthen the simulated "fog of war": time-filtered observations, explicit
+belief updates, blinded model inputs and external validation. The AI still makes
+the judgment call among permitted actions. This setup controls information
+supplied by the application; it does not erase pretrained memories or prove
+that remembered historical outcomes cannot influence a choice. Its effectiveness
+against that remaining risk has not yet been measured in real-model experiments.
+See [Historical blinding and pretrained knowledge](docs/USER_GUIDE.md#historical-blinding-and-pretrained-knowledge)
+for the paper's contribution, our adaptation and the limits of the evidence.
+
 ## Layout
 
 `src/spx_research/` follows the spec's target decomposition: `domain`, `data`,

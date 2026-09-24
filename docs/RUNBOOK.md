@@ -145,6 +145,12 @@ No paid deployment is authorized or exercised by synthetic acceptance.
 
 ## Audits and acceptance
 
+The [user guide's blinding explanation](USER_GUIDE.md#historical-blinding-and-pretrained-knowledge)
+distinguishes the UserHarness-inspired information boundary from removal of
+pretrained knowledge. Invariance checks verify the application's requests;
+accepted evidence references do not prove the internal cause of an AI judgment.
+Do not present a successful audit as measured elimination of historical memory.
+
 `leakage-eval RUN_DIR` requires the applicable evidence. For two runs add
 `--control-dir CONTROL --cutoff AWARE_ISO_TIMESTAMP --expect invariant|changed`.
 Controls share the visible alias namespace/key and corresponding actor scopes.
