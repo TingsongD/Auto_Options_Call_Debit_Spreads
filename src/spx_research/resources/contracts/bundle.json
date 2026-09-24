@@ -1,0 +1,48 @@
+{
+  "bundle_version": "2.1",
+  "files": {
+    "config/research.example.yaml": "1c4f663df775d7555cec551a138626b406224f92aef551d3366fa5dabc452e62",
+    "config/synthetic.example.yaml": "e4ffad0002086a9a191d4e0173b07f0d3bf463cf60c55feff8aa40312234824f",
+    "examples/manager_allocate.json": "da98e1c9dd28b38df615dc9989ed81e6db81ce8981d7b5f473b2e3ba5408289f",
+    "examples/manager_packet.json": "e832d3d05869f36116a3781c4c796e728713599d0fc768e6c746e97033609e6e",
+    "examples/reference_packet.json": "c80b1a0c4a853b7e5177766b00fe5d20f01ce61c6ebedab42fcdb170385de948",
+    "examples/reference_proposal.json": "a2e3a4d9fbabeaff3d6e20862e7492b94e7163218a7e2cb16324d89e4be8d3d6",
+    "examples/reference_witness_private.json": "d1905d48b23e00fe6cfc4260807dbd9520d5552425a61aa8db40d1634684b6da",
+    "examples/spread_entry_packet.json": "cf3617f0cb524d0314b278c20c8127d51ead0b4196c90d926c78a569f964b886",
+    "examples/spread_hold.json": "bbf20985d08facea364c61569236218f6427a9367c11a7a658b6478c7485c4c2",
+    "examples/spread_open.json": "cf292e2314dc28bd5bf57dc17a641e8b2d69d554a082af4aa04bf83bfea9e92d",
+    "examples/spread_packet.json": "6de4ae827eed0a3187057718410f58b3793cf1d2d83b327cc109e4905ffd5fa9",
+    "prompts/manager.md": "0c4a1408793728e59948f3f6a8034aad042c624c6feb35e237176bc312f37da6",
+    "prompts/spread_agent.md": "df44b2a599575a6d244bdcf193ef9b96bc685688f1eaeb327bd914b12b1ff030",
+    "schemas/decision_witness.schema.json": "e68f7a7df78d49e1882da16de1a18624fb9a148a05480669ef6fe60baec0da3b",
+    "schemas/manager_decision.schema.json": "ba933e8d4f05be02c6dc7312aeb99cd98fcf664398e2a0e46d0c1791cdc54b25",
+    "schemas/model_visible_packet.schema.json": "cfca03a56498b9384fd5ba73aee87a5782d3bf05482d1db29b7fff654ed498a8",
+    "schemas/spread_decision.schema.json": "abec979487079b7fb178363b5da95c45796e19c74505ad305500bbe21308c422"
+  },
+  "schema_canonical_sha256": {
+    "schemas/decision_witness.schema.json": "13d539482eb2e97b0ed6aeb749ccc91d6b5e93685b5e591e5eee86f62d833e0a",
+    "schemas/manager_decision.schema.json": "e48278834eb3add9b011ac1351b81e5f1445aea812325fa224acae8cd4d3b44f",
+    "schemas/model_visible_packet.schema.json": "8b009bcaf5a69065cd6931b9535d413d9e87c2c7ca4de929c1497d8873d01ad7",
+    "schemas/spread_decision.schema.json": "0b1c1c70f2958a4a10bb313e4fd0f776f77459c16bbbe27be100295d9be1deee"
+  },
+  "source": "spx_ai_handover_v2",
+  "source_sha256": {
+    "config/research.example.yaml": "7c6233befa3fd180361443bb2452338f7dec64eee5decafc8bb8125c8bd8d1ed",
+    "config/synthetic.example.yaml": "e4ffad0002086a9a191d4e0173b07f0d3bf463cf60c55feff8aa40312234824f",
+    "examples/manager_allocate.json": "cfef9e276612cdb9943b51f9e68aa64f98cf3e80fab5ea06e69e7b5d7fb464b9",
+    "examples/manager_packet.json": "401efb1dd3b09540d7372c9dedd0895a2d87abb5c5cabd231be5b238ce948042",
+    "examples/reference_packet.json": "f50a3f1efb4fc45dffd9f21e6563eb9a185bb205ae384a20e8704fc3079e6d6e",
+    "examples/reference_proposal.json": "d93db418462e409de13ae328745caa5f52b5a24befd5c704e942fa09c0f24725",
+    "examples/reference_witness_private.json": "37181143584637bf4a375b482c27feda72fb2d546e8c0ed589ead9982b8fe7fa",
+    "examples/spread_entry_packet.json": "fe4da26cfb12c32d151bdeb95eb86aa6de687ab10f5229b5aeab3a685f3686c1",
+    "examples/spread_hold.json": "e22261f9e75a0cf4a51772b707e18e0ca36ccf5a41a9f67b9a84b8c28ebc0e6f",
+    "examples/spread_open.json": "df35f0488d1003cc467c9402cfbb4c46dd9977b14d042f26f6a9161b57807a9d",
+    "examples/spread_packet.json": "d2ee57e508270a3d0294fad8aababbc8138ae35ce4641f63e898be88645407a0",
+    "prompts/manager.md": "cd7a091693b59e43d7d7e7caf2a78a481c317cbd0c73bfede9b600c02c1d8ad7",
+    "prompts/spread_agent.md": "d4bc157ae89b035e54eb0cac13c22f2e96fcc232e9c2b580623b28db51590cf8",
+    "schemas/decision_witness.schema.json": "88c5230f02809c2d9ab1f8be443c9093f93306b6cdc1c91dd4be1bd4e5a69ef8",
+    "schemas/manager_decision.schema.json": "b1f0e19306e5d700805c1dc603f767037e873c8cb86b4ea7214c8e657bd8a3e1",
+    "schemas/model_visible_packet.schema.json": "5ea19c7a86643a7734c19d3622131206318c88c12d6b74cf54aa14bd95bfffec",
+    "schemas/spread_decision.schema.json": "fa0e069513b8ec1aec5ae59b2ffd17a0d8dd4f57350a778adb6bc3efe1ea294a"
+  }
+}

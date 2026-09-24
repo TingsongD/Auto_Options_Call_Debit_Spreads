@@ -1,0 +1,22 @@
+{
+  "schema_version": "2.1",
+  "actor_role": "SPREAD",
+  "decision_token": "dec_entry",
+  "packet_token": "pkt_entry",
+  "prior_belief_token": "bel_demo",
+  "action_id": "act_open",
+  "premise_tokens": [
+    "ev_budget",
+    "ev_slot"
+  ],
+  "assessment_updates": [],
+  "reason_codes": [
+    "ENTRY_CRITERIA",
+    "RISK_BUDGET"
+  ],
+  "uncertainty_codes": [
+    "UNKNOWN_FUTURE_POLICY_PATH",
+    "UNKNOWN_FUTURE_PRICE_PATH"
+  ],
+  "confidence_label": "LOW"
+}

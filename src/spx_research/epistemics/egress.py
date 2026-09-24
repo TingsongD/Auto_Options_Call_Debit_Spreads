@@ -47,6 +47,13 @@ def _strings(value: Any) -> list[str]:
     return []
 
 
+_OPAQUE_TOKEN = re.compile(r"^(?:ep|dec|pkt|bel|ev|act|as|target|limit)_[0-9a-f]{24}$")
+
+
+def _is_opaque_token(value: str) -> bool:
+    return _OPAQUE_TOKEN.fullmatch(value) is not None
+
+
 def egress_check(public: Mapping[str, Any], ctx: Context) -> None:
     """Fail closed if the serialized packet contains identity cues."""
     forbidden_literals = [
@@ -57,6 +64,8 @@ def egress_check(public: Mapping[str, Any], ctx: Context) -> None:
         (ctx.alias_namespace, "ALIAS_NAMESPACE"),
     ]
     for s in _strings(public):
+        if _is_opaque_token(s):
+            continue  # HMAC substrings are not literal identity disclosures.
         # Pure-numeric values (prices, fractions, counts) cannot encode dates;
         # scan only non-numeric strings for date/time/symbol patterns.
         if not _is_numeric(s):
@@ -67,7 +76,11 @@ def egress_check(public: Mapping[str, Any], ctx: Context) -> None:
             if lit and lit in s:
                 raise HarnessError(f"EGRESS_LEAK:{name}")
     # Whole-packet belt: the canonical serialization must be leak-free too.
-    blob = canonical(public)
+    blob = re.sub(
+        rb'"(?:ep|dec|pkt|bel|ev|act|as|target|limit)_[0-9a-f]{24}"',
+        b'"<opaque>"',
+        canonical(public),
+    )
     for lit, name in forbidden_literals:
         if lit and lit.encode() in blob:
             raise HarnessError(f"EGRESS_LEAK:{name}")

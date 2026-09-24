@@ -1,0 +1,20 @@
+{
+  "schema_version": "2.1",
+  "actor_role": "SPREAD",
+  "decision_token": "dec_b9d16d25a4ff6a966835ee96",
+  "packet_token": "pkt_615d8345c42b95c1ff723ba6",
+  "prior_belief_token": "bel_6a44cc43674a1ce0adb878b6",
+  "action_id": "act_4568f3720d11bf76d2417b8c",
+  "premise_tokens": [
+    "ev_521cbcba2bbce16a6606a1df",
+    "ev_0bbdd89d304930898da2bef0"
+  ],
+  "assessment_updates": [],
+  "reason_codes": [
+    "MAINTAIN_THESIS"
+  ],
+  "uncertainty_codes": [
+    "UNKNOWN_FUTURE_POLICY_PATH"
+  ],
+  "confidence_label": "LOW"
+}

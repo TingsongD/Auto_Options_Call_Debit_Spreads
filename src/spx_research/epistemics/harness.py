@@ -182,6 +182,22 @@ class Harness:
             token = self.token(ctx.alias_namespace, "act", choice.internal_id)
             if token in action_map:
                 raise HarnessError("DUPLICATE_ACTION")
+            for name, value, unit in choice.attributes:
+                registration = VOCAB.get(name)
+                if registration is None or registration[0] != unit:
+                    raise HarnessError("UNAPPROVED_MENU_ATTRIBUTE")
+                allowed = registration[1]
+                if not isinstance(value, str):
+                    raise HarnessError("INVALID_VALUE")
+                if allowed is not None:
+                    if value not in allowed:
+                        raise HarnessError("UNAPPROVED_MENU_ATTRIBUTE")
+                else:
+                    try:
+                        if not Decimal(value).is_finite():
+                            raise HarnessError("NONFINITE_VALUE")
+                    except InvalidOperation as exc:
+                        raise HarnessError("UNAPPROVED_MENU_ATTRIBUTE") from exc
             action_map[token] = choice
             target_token = (
                 self.token(ctx.alias_namespace, "target", choice.target_internal_id)
@@ -199,7 +215,10 @@ class Harness:
                     "kind": choice.kind,
                     "target_token": target_token,
                     "limit_option_token": limit_token,
-                    "attributes": [],
+                    "attributes": [
+                        {"name": name, "value": value, "unit": unit}
+                        for name, value, unit in choice.attributes
+                    ],
                     "required_premise_tokens": [
                         self.token(ctx.alias_namespace, "ev", x) for x in choice.required_atoms
                     ],
@@ -225,7 +244,7 @@ class Harness:
             if u not in UNKNOWNS:
                 raise HarnessError("UNAPPROVED_TEXT")
         packet = {
-            "schema_version": "2.0",
+            "schema_version": "2.1",
             "actor_role": ctx.actor_role,
             "episode_token": self.token(ctx.alias_namespace, "ep", "episode"),
             "decision_token": self.token(
@@ -295,7 +314,10 @@ class Harness:
         unknowns = strings(proposal["uncertainty_codes"], UNKNOWNS)
         if not reasons or not unknowns or ("NONE_IDENTIFIED" in unknowns and len(unknowns) > 1):
             raise HarnessError("INVALID_CODES")
-        if proposal["confidence_label"] not in CONFIDENCE:
+        if (
+            not isinstance(proposal["confidence_label"], str)
+            or proposal["confidence_label"] not in CONFIDENCE
+        ):
             raise HarnessError("INVALID_CONFIDENCE")
         if not isinstance(proposal["assessment_updates"], list):
             raise HarnessError("INVALID_ASSESSMENTS")
@@ -309,7 +331,9 @@ class Harness:
                 raise HarnessError("INVALID_ASSESSMENT_TOPIC")
             seen_topics.add(topic)
             if (
-                update["assessment"] not in TOPICS[topic]
+                not isinstance(update["assessment"], str)
+                or not isinstance(update["confidence_label"], str)
+                or update["assessment"] not in TOPICS[topic]
                 or update["confidence_label"] not in CONFIDENCE
             ):
                 raise HarnessError("INVALID_ASSESSMENT_VALUE")
@@ -321,7 +345,7 @@ class Harness:
         accepted_atoms = [compiled.premise_map[p] for p in sorted(premises)]
         ctx = compiled.context
         return {
-            "schema_version": "2.0",
+            "schema_version": "2.1",
             "private_decision_id": proposal["decision_token"],
             "run_id": ctx.run_id,
             "branch_id": ctx.branch_id,

@@ -23,7 +23,7 @@ from spx_research.domain.state import (
     Reservation,
     ReservationStatus,
 )
-from spx_research.domain.types import CreditSpread, Direction, PricePoints, Right
+from spx_research.domain.types import CreditSpread, Direction, DomainError, PricePoints, Right
 from spx_research.engine.accounting import (
     AccountSnapshot,
     apply_entry_fill,
@@ -48,6 +48,17 @@ def _contract(p: dict[str, Any]) -> Any:
         settlement_style=p["settlement_style"],
         multiplier=int(p["multiplier"]),
         price_increment=Decimal(str(p["price_increment"])),
+        last_trading_at_utc=(
+            datetime.fromisoformat(p["last_trading_at_utc"])
+            if p.get("last_trading_at_utc")
+            else None
+        ),
+        settlement_event_at_utc=(
+            datetime.fromisoformat(p["settlement_event_at_utc"])
+            if p.get("settlement_event_at_utc")
+            else None
+        ),
+        settlement_value_symbol=p.get("settlement_value_symbol"),
     )
 
 
@@ -66,6 +77,13 @@ def contract_payload(c: Any) -> dict[str, Any]:
         "settlement_style": c.settlement_style,
         "multiplier": c.multiplier,
         "price_increment": str(c.price_increment),
+        "last_trading_at_utc": (
+            c.last_trading_at_utc.isoformat() if c.last_trading_at_utc else None
+        ),
+        "settlement_event_at_utc": (
+            c.settlement_event_at_utc.isoformat() if c.settlement_event_at_utc else None
+        ),
+        "settlement_value_symbol": c.settlement_value_symbol,
     }
 
 
@@ -100,6 +118,10 @@ def fold(state: EngineState, ev: Event) -> EngineState:
     """Apply one committed event to the aggregate. Order is the log's order."""
     p = ev.payload
     st = state
+    if ev.run_id != st.run_id:
+        raise DomainError("CROSS_RUN_EVENT")
+    if ev.seq != st.seq + 1:
+        raise DomainError("EVENT_SEQUENCE_MISMATCH")
     st.seq = ev.seq
     if ev.type == "RESERVATION_HELD":
         st.reservations[p["reservation_id"]] = Reservation(

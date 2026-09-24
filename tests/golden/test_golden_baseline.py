@@ -1,148 +1,67 @@
-"""Golden baseline battery: the mechanical engine is a deterministic function
-of (dataset, profile). Any change to engine semantics flips the event digest —
-that is the point: this battery is the tripwire that forces a deliberate
-decision when behavior changes, not an accident.
+"""Frozen synthetic T20 portfolio: three independent one-lot spreads.
+
+Each opens at 2 points, closes at 1.30 points, and pays $1 per leg each
+way. Hand reconciliation: cash 10000 + 3 * (200 - 130 - 4) = 10198;
+fees $12, zero remaining reserve. This fixture has no paid/provider data.
 """
 
-from __future__ import annotations
-
-from datetime import date, timedelta
 from decimal import Decimal
-from typing import Any
 
-import pytest
-
-from spx_research.config import Profile
-from spx_research.data.availability import Archive
-from spx_research.data.synthetic import SyntheticSpec, generate
 from spx_research.engine.ledger import replay
+from spx_research.engine.scheduler import Engine
 from spx_research.persistence.events import InMemoryEventStore
 from spx_research.reporting.report import event_log_digest
 from spx_research.research.leakage import verify_hash_chain
 from spx_research.research.mechanical import MechanicalPolicy
-from spx_research.temporal.calendar import build_weekday_manifest
-
-START = date(2024, 1, 2)
-END = date(2024, 2, 16)
-EXPIRY = END
+from tests.engine_support import START, TinyArchive, tiny_calendar, tiny_profile
 
 
-def _profile() -> Profile:
-    return Profile.model_validate(
-        {
-            "profile_id": "golden-mech",
-            "mode": "synthetic_test",
-            "permissions": {
-                "real_data_requests": False,
-                "real_model_requests": False,
-                "broker_writes": False,
-            },
-            "universe": {
-                "allowed_contract_roots": ["SPXW"],
-                "strategies": ["BULL_PUT_CREDIT", "BEAR_CALL_CREDIT"],
-                "target_entry_dte_calendar_days": 45,
-                "entry_dte_range": [40, 50],
-                "spread_widths_index_points": [Decimal("25")],
-                "short_abs_delta_range": [Decimal("0.15"), Decimal("0.35")],
-                "max_candidates_per_direction": 12,
-            },
-            "clock": {
-                "agent_review_minutes": 15,
-                "simulated_execution_delay_seconds": 60,
-            },
-            "study": {
-                "start_date": START,
-                "scored_end_date": END,
-                "runoff_end_date": END + timedelta(days=30),
-            },
-            "portfolio": {
-                "initial_capital_usd": Decimal("10000"),
-                "max_open_or_reserved_slots": 3,
-                "bullish_weight": 2,
-                "bearish_weight": 1,
-                "max_per_spread_initial_risk_usd": Decimal("3000"),
-                "max_aggregate_committed_risk_usd": Decimal("9000"),
-                "reservation_buffer_usd": Decimal("10"),
-            },
-            "exit_policy": {
-                "profit_review_band": [Decimal("0.3"), Decimal("0.4")],
-                "loss_review_band": [Decimal("0.2"), Decimal("0.3")],
-                "loss_activation_days_held": 25,
-            },
-            "manager": {},
-            "execution": {
-                "opening_fee_per_leg_usd": Decimal("1"),
-                "closing_fee_per_leg_usd": Decimal("1"),
-            },
-        }
+def run_golden():
+    calendar = tiny_calendar()
+    policy = MechanicalPolicy(profit_trigger=Decimal("0.30"))
+    return Engine(
+        tiny_profile(),
+        calendar,
+        TinyArchive(calendar),
+        InMemoryEventStore(),
+        lambda _: policy,
+        run_id="golden-hand-v2",
+    ).run(START, START)
+
+
+def test_hand_reconciled_cash_equity_and_frozen_digest():
+    result = run_golden()
+    assert result.status == "COMPLETED"
+    assert result.final_state.account.cash == Decimal("10198.00")
+    assert result.final_state.account.reserved == 0
+    assert result.final_state.account.fees_paid == Decimal("12.00")
+    assert len([e for e in result.events if e.type == "POSITION_CLOSED"]) == 3
+    assert result.valuations[-1]["net_liquidation_equity_usd"] == "10198.00"
+    # Fixed after checking each cash movement and valuation above, not calculated by the test.
+    assert (
+        event_log_digest(result.events)
+        == "9ab344f7e32d2463dd45d14e6940e1e7fd2108f50f4c0bbcd1e4c9894faf7a2c"
     )
 
 
-@pytest.fixture(scope="module")
-def dataset(tmp_path_factory: pytest.TempPathFactory) -> tuple[Archive, Any]:
-    root = tmp_path_factory.mktemp("golden-ds")
-    cal = build_weekday_manifest("cal-golden", START, END + timedelta(days=35))
-    spec = SyntheticSpec(
-        dataset_id="golden",
-        seed=7,
-        start=START,
-        end=END,
-        expiries=(EXPIRY,),
-        strike_step=Decimal("25"),
-        strikes_each_side=24,
+def test_entry_credit_is_offset_by_liability_and_not_reserve():
+    result = run_golden()
+    mark = next(v for v in result.valuations if len(v["positions"]) == 3)
+    assert mark["cash_usd"] == "10594.00"  # three credits of 200, opening fees 6
+    assert mark["reserved_usd"] == "3000.00"
+    assert mark["mid_liability_usd"] == "630.00"
+    assert mark["liquidation_liability_usd"] == "660.00"
+    assert mark["mid_equity_usd"] == "9964.00"
+    assert mark["net_liquidation_equity_usd"] == "9928.00"  # deduct estimated closing fees 6
+
+
+def test_frozen_chain_and_replay():
+    result = run_golden()
+    assert verify_hash_chain(result.events)
+    restored = replay(result.run_id, Decimal("10000"), result.events)
+    assert restored.account == result.final_state.account
+    assert restored.positions == result.final_state.positions
+    assert all(
+        a.sim_time_utc <= b.sim_time_utc
+        for a, b in zip(result.events, result.events[1:], strict=False)
     )
-    generate(root, spec, cal)
-    return Archive(root / "golden"), cal
-
-
-def _run(archive: Archive, cal: Any, run_id: str) -> Any:
-    from spx_research.engine.scheduler import Engine
-
-    mech = MechanicalPolicy(
-        profit_trigger=Decimal("0.35"),
-        loss_trigger=Decimal("-0.25"),
-        loss_activation_days=25,
-        min_entry_credit_fraction=Decimal("0"),
-    )
-    eng = Engine(_profile(), cal, archive, InMemoryEventStore(), lambda _r: mech, run_id=run_id)
-    return eng.run(START, END + timedelta(days=30))
-
-
-def test_identical_runs_produce_identical_digest(dataset) -> None:
-    """The engine is a pure function of its inputs — two runs differ only in
-    run_id-scoped identity fields, and the event digest must match exactly."""
-    archive, cal = dataset
-    a = _run(archive, cal, "golden-a")
-    b = _run(archive, cal, "golden-a")  # same run_id → fully identical
-    assert event_log_digest(a.events) == event_log_digest(b.events)
-
-
-def test_golden_run_trades_and_settles(dataset) -> None:
-    """A golden baseline that never trades proves nothing — pin that this
-    fixture exercises entry, review, and settlement."""
-    archive, cal = dataset
-    result = _run(archive, cal, "golden-1")
-    types = {e.type for e in result.events}
-    assert "ORDER_SUBMITTED" in types
-    assert "POSITION_OPENED" in types
-    assert types & {"POSITION_CLOSED", "POSITION_SETTLED"}
-    assert "RUN_ENDED" in types
-
-
-def test_golden_chain_and_replay(dataset) -> None:
-    archive, cal = dataset
-    result = _run(archive, cal, "golden-2")
-    assert verify_hash_chain(result.events) is True
-    st = replay("golden-2", Decimal("10000"), result.events)
-    assert st.account.cash == result.final_state.account.cash
-    assert st.account.reserved == result.final_state.account.reserved
-
-
-def test_data_gap_is_once_per_position_per_day(dataset) -> None:
-    """Golden invariant from W5: at most one DATA_GAP per position per day —
-    a per-minute spam regression flips this."""
-    archive, cal = dataset
-    result = _run(archive, cal, "golden-3")
-    gaps = [e for e in result.events if e.type == "DATA_GAP"]
-    seen = {(g.payload.get("position_id"), g.sim_time_utc.date()) for g in gaps}
-    assert len(seen) == len(gaps)

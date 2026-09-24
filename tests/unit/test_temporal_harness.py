@@ -78,7 +78,7 @@ class HarnessReferenceTests(unittest.TestCase):
     def proposal(self, compiled):
         p = compiled.public
         return {
-            "schema_version": "2.0",
+            "schema_version": "2.1",
             "actor_role": p["actor_role"],
             "decision_token": p["decision_token"],
             "packet_token": p["packet_token"],

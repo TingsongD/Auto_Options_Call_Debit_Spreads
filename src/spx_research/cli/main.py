@@ -4,11 +4,10 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import asdict
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Annotated, Any, NoReturn
+from typing import Annotated, Any, Literal
 
 import typer
 from pydantic import ValidationError
@@ -101,288 +100,116 @@ def generate_synthetic(
 @app.command()
 def run(
     profile_path: Annotated[Path, typer.Argument(help="YAML run profile")],
-    dataset_root: Annotated[Path, typer.Option(help="dataset root with manifest.json")],
-    out: Annotated[Path, typer.Option(help="run output directory")],
+    dataset_root: Annotated[Path, typer.Option(help="verified dataset root")],
+    out: Annotated[Path, typer.Option(help="new run output directory")],
     start: Annotated[str | None, typer.Option()] = None,
-    end: Annotated[str | None, typer.Option()] = None,
-    run_id: Annotated[str, typer.Option()] = "run-0001",
-    store: Annotated[str, typer.Option(help="memory|postgres (dsn from SPX_DB_DSN)")] = "memory",
-    policy: Annotated[
-        str, typer.Option(help="mechanical|llm-mock|llm — decision policy")
-    ] = "mechanical",
-    tape: Annotated[Path | None, typer.Option(help="decision tape path (llm policies)")] = None,
-    model: Annotated[str | None, typer.Option(help="model id for --policy llm")] = None,
-    budget_usd: Annotated[str | None, typer.Option(help="API spend cap for --policy llm")] = None,
-    price_in_per_mtok: Annotated[
-        str | None, typer.Option(help="USD per million input tokens")
+    end: Annotated[str | None, typer.Option(help="effective runoff end date")] = None,
+    run_id: Annotated[str | None, typer.Option()] = None,
+    store: Annotated[str, typer.Option(help="memory|postgres")] = "memory",
+    policy: Annotated[str, typer.Option(help="mechanical|llm-mock|llm-replay|llm")] = "mechanical",
+    tape: Annotated[
+        Path | None, typer.Option(help="sealed version 2 input required by llm-replay")
     ] = None,
-    price_out_per_mtok: Annotated[
-        str | None, typer.Option(help="USD per million output tokens")
-    ] = None,
+    model: Annotated[str | None, typer.Option()] = None,
+    budget_usd: Annotated[str | None, typer.Option()] = None,
+    price_in_per_mtok: Annotated[str | None, typer.Option()] = None,
+    price_out_per_mtok: Annotated[str | None, typer.Option()] = None,
+    price_cached_per_mtok: Annotated[str | None, typer.Option()] = None,
+    model_context_limit: Annotated[int | None, typer.Option()] = None,
+    transport: Annotated[str, typer.Option(help="in-process mock|docker")] = "in-process",
+    worker_image: Annotated[str, typer.Option()] = "spx-inference:2.1",
+    gateway_volume: Annotated[str, typer.Option()] = "spx_mock_gateway_socket",
+    alias_namespace: Annotated[
+        str, typer.Option(help="shared visible scope for controls")
+    ] = "spx-comparison-v2.1",
 ) -> None:
-    """Execute the deterministic baseline engine over a dataset (M3)."""
-    from spx_research.data.availability import Archive
-    from spx_research.engine.scheduler import Engine
-    from spx_research.persistence.events import InMemoryEventStore
-    from spx_research.persistence.postgres import PostgresEventStore, create_engine
-    from spx_research.reporting.report import run_manifest, summarize
-    from spx_research.research.mechanical import MechanicalPolicy
-    from spx_research.temporal.calendar import load_manifest
+    """Freeze inputs and run; PostgreSQL is required for restart or paid inference."""
+    from uuid import uuid4
 
-    profile = load_profile(profile_path)
-    findings = blocking(check(profile))
-    if findings:
-        for f in findings:
-            typer.secho(f"BLOCK {f.code} {f.path}: {f.detail}", fg=typer.colors.RED)
-        raise typer.Exit(1)
-    cal = load_manifest(dataset_root / "calendar.json")
-    archive = Archive(dataset_root)
-    assert profile.study is not None and profile.study.start_date is not None
-    s = date.fromisoformat(start) if start else profile.study.start_date
-    e = (
-        date.fromisoformat(end)
-        if end
-        else (profile.study.runoff_end_date or profile.study.scored_end_date)
-    )
-    assert e is not None, "no end date in profile or --end"
-
-    assert profile.exit_policy is not None
-    pb, lb = profile.exit_policy.profit_review_band, profile.exit_policy.loss_review_band
-    mech = MechanicalPolicy(
-        profit_trigger=(pb[0] + pb[1]) / 2,
-        loss_trigger=-(lb[0] + lb[1]) / 2,
-        loss_activation_days=profile.exit_policy.loss_activation_days_held,
-    )
-    mft = json.loads((dataset_root / "manifest.json").read_text())
-    tape_path = tape or (out / "decision_tape.jsonl")
-    if store == "postgres":
-        from spx_research.epistemics.store import ObservationLedger
-        from spx_research.persistence.postgres import PostgresObservationLedger
-
-        dsn = os.environ.get("SPX_DB_DSN")
-        if not dsn:
-            typer.secho("SPX_DB_DSN is not set", fg=typer.colors.RED, err=True)
-            raise typer.Exit(2)
-        pg_engine = create_engine(dsn)
-        event_store: InMemoryEventStore | PostgresEventStore = PostgresEventStore(pg_engine)
-        obs_ledger: ObservationLedger = PostgresObservationLedger(pg_engine)
-    elif store == "memory":
-        from spx_research.epistemics.store import InMemoryObservationLedger, ObservationLedger
-
-        event_store = InMemoryEventStore()
-        obs_ledger = InMemoryObservationLedger()
-    else:
-        typer.secho(f"unknown store {store!r}", fg=typer.colors.RED)
-        raise typer.Exit(2)
-    if policy == "mechanical":
-        policy_provider = lambda _role: mech  # noqa: E731
-    elif policy in ("llm-mock", "llm"):
-        try:
-            policy_provider = _llm_policy_provider(
-                policy=policy,
-                profile=profile,
-                run_id=run_id,
-                branch_id="main",
-                tape_path=tape_path,
-                model_id=model,
-                budget_usd=Decimal(budget_usd) if budget_usd else None,
-                price_in=Decimal(price_in_per_mtok) if price_in_per_mtok else None,
-                price_out=Decimal(price_out_per_mtok) if price_out_per_mtok else None,
-                manifest_id=str(mft.get("manifest_id", "local")),
-                ledger=obs_ledger,
-            )
-        except InvalidOperation:
-            typer.secho("invalid decimal in --budget-usd/--price-*", fg=typer.colors.RED, err=True)
-            raise typer.Exit(2) from None
-    else:
-        typer.secho(f"unknown policy {policy!r}", fg=typer.colors.RED, err=True)
-        raise typer.Exit(2)
-    engine = Engine(profile, cal, archive, event_store, policy_provider, run_id=run_id)
-    result = engine.run(s, e)
-
-    out.mkdir(parents=True, exist_ok=True)
-    with (out / "events.jsonl").open("w") as fh:
-        for ev in result.events:
-            fh.write(json.dumps(asdict(ev), sort_keys=True, default=str) + "\n")
-    (out / "run_manifest.json").write_text(
-        json.dumps(
-            run_manifest(
-                result,
-                profile,
-                mft.get("manifest_id"),
-                extra={
-                    "branch_id": engine.branch_id,
-                    "policy": policy,
-                    "private_manifest_id": (
-                        str(mft.get("manifest_id", "local")) if policy != "mechanical" else ""
-                    ),
-                    "tape_path": str(tape_path) if policy != "mechanical" else None,
-                    "policy_meta": getattr(policy_provider, "meta", {}),
-                },
-            ),
-            indent=2,
-        )
-    )
-    (out / "report.json").write_text(json.dumps(summarize(result), indent=2))
-    typer.secho(
-        f"OK: {len(result.events)} events, cash={result.final_state.account.cash} -> {out}",
-        fg=typer.colors.GREEN,
-    )
-
-
-def _llm_policy_provider(
-    *,
-    policy: str,
-    profile: Any,
-    run_id: str,
-    branch_id: str,
-    tape_path: Path,
-    model_id: str | None,
-    budget_usd: Decimal | None,
-    price_in: Decimal | None,
-    price_out: Decimal | None,
-    manifest_id: str,
-    ledger: Any,
-) -> Any:
-    """Build a per-role LLMPolicy factory over one shared pipeline (B2).
-
-    ``llm-mock`` is fully offline; ``llm`` fails closed unless the profile
-    permits real model requests, OPENAI_API_KEY is set, a model id is known,
-    and a bounded budget with explicit price rates is configured.
-
-    ``models.resolved_model_ids_manifest`` (a JSON file ``{"manager_role":
-    ..., "spread_role": ...}``) pins per-role model ids; ``--model``
-    overrides both roles. ``models.price_sheet_id`` (a JSON file
-    ``{"model_id", "input_per_mtok", "output_per_mtok"}``) supplies prices
-    when ``--price-*`` are not given.
-    """
-    import hmac as hmac_mod
-
-    from spx_research.agents.graphs import PolicyDeps
-    from spx_research.agents.llm_policy import LLMPolicy
-    from spx_research.contracts import SpecNotFoundError, load_prompt, load_schema
-    from spx_research.epistemics.harness import Harness
-    from spx_research.llm.tape import DecisionTape
-
-    def _fail(msg: str) -> NoReturn:
-        typer.secho(msg, fg=typer.colors.RED, err=True)
-        raise typer.Exit(2)
+    from spx_research.cli.execution import execute
 
     try:
-        system_prompts = {
-            "manager": load_prompt("manager"),
-            "spread": load_prompt("spread_agent"),
-        }
-        schemas = {
-            "manager_decision": load_schema("manager_decision"),
-            "spread_decision": load_schema("spread_decision"),
-        }
-    except SpecNotFoundError as e:
-        _fail(f"spec contracts unavailable: {e}")
+        if tape is not None and policy != "llm-replay":
+            raise ValueError("TAPE_INPUT_REQUIRES_LLM_REPLAY_POLICY")
+        if policy == "llm-replay" and tape is None:
+            raise ValueError("REPLAY_REQUIRES_TAPE_INPUT")
+        profile = load_profile(profile_path)
+        if profile.study is None:
+            raise ValueError("MISSING_STUDY")
+        s = date.fromisoformat(start) if start else profile.study.start_date
+        e = (
+            date.fromisoformat(end)
+            if end
+            else (profile.study.runoff_end_date or profile.study.scored_end_date)
+        )
+        if s is None or e is None:
+            raise ValueError("MISSING_STUDY_BOUNDARIES")
+        profile.study.start_date, profile.study.runoff_end_date = s, e
+        result = execute(
+            profile=profile,
+            dataset_root=dataset_root,
+            out=out,
+            start=s,
+            end=e,
+            run_id=run_id or f"run-{uuid4().hex}",
+            store_kind=store,
+            policy=policy,
+            policy_options={
+                "model_id": model,
+                "budget_usd": Decimal(budget_usd) if budget_usd else None,
+                "price_in": Decimal(price_in_per_mtok) if price_in_per_mtok else None,
+                "price_out": Decimal(price_out_per_mtok) if price_out_per_mtok else None,
+                "price_cached": Decimal(price_cached_per_mtok) if price_cached_per_mtok else None,
+                "context_limit": model_context_limit,
+                "transport": transport,
+                "worker_image": worker_image,
+                "gateway_volume": gateway_volume,
+                "alias_namespace": alias_namespace,
+                "replay_source": tape,
+            },
+        )
+    except (OSError, ValueError, InvalidOperation) as exc:
+        typer.secho(f"BLOCK: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(2) from exc
+    _show_run(result, out)
 
-    models = profile.models
-    # Pinned per-role ids: the resolved-model-ids manifest wins over the
-    # loose *_role_candidate fields; --model overrides everything.
-    role_ids: dict[str, str] = {}
-    if models and models.resolved_model_ids_manifest:
-        try:
-            resolved = json.loads(Path(models.resolved_model_ids_manifest).read_text())
-        except (OSError, json.JSONDecodeError) as e:
-            _fail(f"cannot read resolved_model_ids_manifest: {e}")
-        for key, role in (("manager_role", "manager"), ("spread_role", "spread")):
-            if resolved.get(key):
-                role_ids[role] = str(resolved[key])
-    if model_id:
-        role_ids = {"manager": model_id, "spread": model_id}
-    if models:
-        role_ids.setdefault("manager", models.manager_role_candidate or "")
-        role_ids.setdefault("spread", models.spread_role_candidate or "")
-    role_ids = {r: m for r, m in role_ids.items() if m}
 
-    sheet: Any = None
-    if policy == "llm-mock":
-        from spx_research.llm.gateway import MockGateway
-
-        gateway: Any = MockGateway()
-        budget = None
-        mid = "mock-1"
-    else:
-        from spx_research.llm.budget import Budget, PriceSheet
-        from spx_research.llm.openai_gateway import OpenAIGateway
-
-        if not profile.permissions.real_model_requests:
-            _fail("--policy llm requires profile.permissions.real_model_requests: true")
-        api_key = os.environ.get("OPENAI_API_KEY")
-        if not api_key:
-            _fail("OPENAI_API_KEY is not set")
-        if not role_ids:
-            _fail(
-                "no model ids: pass --model, set models.*_role_candidate, or "
-                "point models.resolved_model_ids_manifest at a resolved file"
-            )
-        mid = role_ids.get("manager") or next(iter(role_ids.values()))
-        cap = budget_usd or (models.experiment_api_budget_usd if models else None)
-        if price_in is not None and price_out is not None:
-            sheet = PriceSheet("cli", mid, price_in, price_out)
-        elif models and models.price_sheet_id:
-            try:
-                ps = json.loads(Path(models.price_sheet_id).read_text())
-                sheet = PriceSheet(
-                    models.price_sheet_id,
-                    str(ps["model_id"]),
-                    Decimal(str(ps["input_per_mtok"])),
-                    Decimal(str(ps["output_per_mtok"])),
-                )
-            except (OSError, json.JSONDecodeError, KeyError, InvalidOperation) as e:
-                _fail(f"cannot read price_sheet_id {models.price_sheet_id}: {e}")
-        if cap is None or sheet is None:
-            _fail(
-                "--policy llm requires a bounded budget: --budget-usd "
-                "(or models.experiment_api_budget_usd) plus "
-                "--price-in-per-mtok/--price-out-per-mtok (or models.price_sheet_id)"
-            )
-        import openai
-
-        gateway = OpenAIGateway(openai.OpenAI(api_key=api_key), mid, sheet, allow_real_calls=True)
-        budget = Budget(cap, sheet)
-
-    tape_path.parent.mkdir(parents=True, exist_ok=True)
-    # Public-token secrecy comes from an operator-held secret, never from
-    # run inputs: deriving the alias key from the dataset manifest id would
-    # make every public token a function of the archive's full content
-    # (including its future) and defeat the future-suffix probe.
-    alias_secret = os.environ.get("SPX_ALIAS_KEY", "")
-    if len(alias_secret) < 16:
-        _fail("SPX_ALIAS_KEY is not set (or <16 chars) — required for public token derivation")
-    alias_key = hmac_mod.new(
-        alias_secret.encode(), f"{run_id}:{branch_id}".encode(), "sha256"
-    ).digest()
-    deps = PolicyDeps(
-        harness=Harness(alias_key),
-        ledger=ledger,
-        gateway=gateway,
-        tape=DecisionTape(tape_path),
-        profile=profile,
-        budget=budget,
-        max_retries=models.retry_attempts_after_initial if models else 2,
-        max_output_tokens=models.max_output_tokens_per_call if models else 800,
-        model_id=mid,
-        model_ids=role_ids or None,
-        private_manifest_id=manifest_id,
-        system_prompts=system_prompts,
-        schemas=schemas,
-        retry_backoff_seconds=2.0 if policy == "llm" else 0.0,
+def _show_run(result: Any, out: Path) -> None:
+    typer.secho(
+        f"{result.status}: {len(result.events)} events, "
+        f"cash={result.final_state.account.cash} -> {out}",
+        fg=typer.colors.GREEN if result.status == "COMPLETED" else typer.colors.YELLOW,
     )
-    pol = LLMPolicy(deps)
+    if result.status != "COMPLETED":
+        typer.secho(f"Pause: {result.pause}", err=True)
+        raise typer.Exit(1)
 
-    def provider(_role: str) -> Any:
-        return pol
 
-    provider.meta = {  # type: ignore[attr-defined]
-        "resolved_model_ids": role_ids or {"*": mid},
-        "price_sheet_id": getattr(sheet, "sheet_id", None) if sheet else None,
-    }
-    return provider
+@app.command()
+def resume(
+    run_dir: Annotated[Path, typer.Argument(help="existing new-format PostgreSQL run")],
+    dataset_root: Annotated[Path | None, typer.Option(help="relocated identical dataset")] = None,
+) -> None:
+    """Verify frozen inputs and continue from the authoritative committed phase."""
+    from spx_research.cli.execution import resume_run
+
+    try:
+        result = resume_run(run_dir, dataset_root)
+    except (OSError, ValueError) as exc:
+        typer.secho(f"BLOCK: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(2) from exc
+    _show_run(result, run_dir)
+
+
+def _llm_policy_provider(**kwargs: Any) -> Any:
+    """Compatibility entry for isolated policy tests; CLI uses execution module."""
+    from spx_research.cli.execution import policy_provider
+
+    try:
+        return policy_provider(**kwargs)
+    except (OSError, ValueError) as exc:
+        typer.secho(str(exc), fg=typer.colors.RED, err=True)
+        raise typer.Exit(2) from exc
 
 
 @app.command()
@@ -400,14 +227,16 @@ def migrate() -> None:
         ),
         None,
     )
-    if ini is None:
-        typer.secho("alembic.ini not found (run from the repo root)", fg=typer.colors.RED, err=True)
-        raise typer.Exit(2)
     if "SPX_DB_DSN" not in os.environ:
         typer.secho("SPX_DB_DSN is not set", fg=typer.colors.RED, err=True)
         raise typer.Exit(2)
-    cfg = Config(str(ini))
-    cfg.set_main_option("script_location", str(ini.parent / "alembic"))
+    cfg = Config(str(ini)) if ini else Config()
+    migrations = (
+        ini.parent / "alembic"
+        if ini
+        else (Path(__file__).resolve().parents[1] / "resources" / "migrations")
+    )
+    cfg.set_main_option("script_location", str(migrations))
     command.upgrade(cfg, "head")
     typer.secho("OK: migrations applied", fg=typer.colors.GREEN)
 
@@ -453,22 +282,34 @@ def leakage_eval(
     tape: Annotated[Path | None, typer.Option(help="decision tape JSONL")] = None,
     initial_cash: Annotated[str, typer.Option()] = "10000",
     out: Annotated[Path | None, typer.Option(help="report output path")] = None,
+    cutoff: Annotated[
+        str | None, typer.Option(help="inclusive aware ISO timestamp for comparison")
+    ] = None,
+    expect: Annotated[str, typer.Option(help="invariant|changed")] = "invariant",
 ) -> None:
     """Fixed-classification leakage evaluation for a run (M6)."""
     from spx_research.research.leakage import compare_runs, evaluate_run
 
+    if expect not in {"invariant", "changed"}:
+        raise typer.BadParameter("expect must be invariant or changed")
+    comparison_expect: Literal["invariant", "changed"] = (
+        "changed" if expect == "changed" else "invariant"
+    )
     report = evaluate_run(run_dir, tape_path=tape, initial_cash=Decimal(initial_cash))
     if control_dir is not None:
-        report["invariance"] = compare_runs(run_dir, control_dir)
+        report["invariance"] = compare_runs(
+            run_dir,
+            control_dir,
+            cutoff=datetime.fromisoformat(cutoff) if cutoff else None,
+            expect=comparison_expect,
+        )
     out_path = out or (run_dir / "leakage_report.json")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(report, indent=2, sort_keys=True))
     checks = report["checks"]
-    ok = bool(
-        checks["hash_chain_ok"]
-        and checks["replay_ok"]
-        and checks.get("log_hash_match") is not False
-    )
+    ok = report.get("status") == "PASS" or report.get("audit_status") == "PASS"
+    if control_dir is not None:
+        ok = ok and report["invariance"].get("success") is True
     n_egress = len(checks["egress_violations"])
     typer.secho(
         f"{'OK' if ok and not n_egress else 'FAIL'}: hash_chain={checks['hash_chain_ok']}"
@@ -488,26 +329,17 @@ def register_run(
     tape: Annotated[Path | None, typer.Option(help="decision tape JSONL")] = None,
     model_id: Annotated[str | None, typer.Option()] = None,
 ) -> None:
-    """Register a run's lineage in the experiment registry (M6)."""
-    import subprocess
+    """Register frozen execution inputs, preserving every distinct run."""
 
     from spx_research.research.experiments import ExperimentRegistry
 
     manifest_path = run_dir / "run_manifest.json"
-    manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
-    import contextlib
-
-    code_version = None
-    with contextlib.suppress(Exception):
-        code_version = subprocess.run(
-            ["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True
-        ).stdout.strip()
-    rec = ExperimentRegistry(registry).register(
-        manifest.get("run_id", run_dir.name),
-        profile_path=profile,
-        dataset_manifest_id=manifest.get("dataset_manifest_id"),
-        model_id=model_id,
-        tape_path=tape,
-        code_version=code_version,
-    )
+    try:
+        if profile or tape or model_id:
+            raise ValueError("REGISTRATION_USES_FROZEN_INPUTS_ONLY")
+        manifest = json.loads(manifest_path.read_text())
+        rec = ExperimentRegistry(registry).register_manifest(manifest)
+    except (OSError, ValueError) as exc:
+        typer.secho(f"BLOCK: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(2) from exc
     typer.secho(f"OK: {rec.experiment_id} (run {rec.run_id}) -> {registry}", fg=typer.colors.GREEN)

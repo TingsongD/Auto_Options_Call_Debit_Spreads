@@ -9,6 +9,7 @@ event and its side-effects atomically (H-08, T40/T41).
 
 from __future__ import annotations
 
+from dataclasses import asdict
 from datetime import datetime
 from typing import Any
 
@@ -38,72 +39,83 @@ class PostgresEventStore:
         outbox: list[dict[str, Any]] | None = None,
     ) -> Event:
         with self._engine.begin() as conn:
-            _scope(conn, event.run_id)
-            # Serialize writers on this run for the duration of the txn.
-            conn.execute(
-                sa.text("SELECT pg_advisory_xact_lock(hashtext(:r))"),
-                {"r": event.run_id},
-            )
-            row = conn.execute(
-                sa.select(S.events.c.seq, S.events.c.event_hash)
-                .where(S.events.c.run_id == event.run_id)
-                .order_by(S.events.c.seq.desc())
-                .limit(1)
-            ).first()
-            if row:
-                seq, prev_hash = row.seq, row.event_hash
-            else:
-                seq, prev_hash = 0, "genesis"
-            if expected_seq != seq:
+            return self.append_in_transaction(conn, [event], expected_seq, outbox)[0]
+
+    def append_batch(self, events: list[Event], expected_seq: int) -> list[Event]:
+        if not events:
+            return []
+        with self._engine.begin() as conn:
+            return self.append_in_transaction(conn, events, expected_seq)
+
+    @staticmethod
+    def append_in_transaction(
+        conn: sa.engine.Connection,
+        events: list[Event],
+        expected_seq: int,
+        outbox: list[dict[str, Any]] | None = None,
+    ) -> list[Event]:
+        if not events:
+            return []
+        run_id = events[0].run_id
+        _scope(conn, run_id)
+        conn.execute(sa.text("SELECT pg_advisory_xact_lock(hashtext(:r))"), {"r": run_id})
+        row = conn.execute(
+            sa.select(S.events.c.seq, S.events.c.event_hash)
+            .where(S.events.c.run_id == run_id)
+            .order_by(S.events.c.seq.desc())
+            .limit(1)
+        ).first()
+        seq, prev_hash = (row.seq, row.event_hash) if row else (0, "genesis")
+        if expected_seq != seq:
+            raise LedgerError("SEQUENCE_MISMATCH")
+        committed = []
+        for event in events:
+            if event.run_id != run_id or event.seq != seq + 1:
                 raise LedgerError("SEQUENCE_MISMATCH")
             e = event.with_hashes(payload_hash(event.payload), prev_hash)
-            if e.seq != seq + 1:
-                raise LedgerError("SEQUENCE_MISMATCH")
-            try:
-                # Auto-register the run row on first append (FK target).
-                conn.execute(
-                    sa.text(
-                        "INSERT INTO runs (run_id, profile_id, status, started_at_utc)"
-                        " VALUES (:r, :p, 'RUNNING', :t) ON CONFLICT (run_id) DO NOTHING"
-                    ),
-                    {
-                        "r": event.run_id,
-                        "p": str(event.payload.get("profile_id", "unknown")),
-                        "t": event.sim_time_utc,
-                    },
+            committed.append(e)
+            seq, prev_hash = e.seq, e.event_hash
+        conn.execute(
+            sa.text(
+                "INSERT INTO runs (run_id,profile_id,status,started_at_utc) "
+                "VALUES (:r,:p,'RUNNING',:t) ON CONFLICT (run_id) DO NOTHING"
+            ),
+            {
+                "r": run_id,
+                "p": str(events[0].payload.get("profile_id", "unknown")),
+                "t": events[0].sim_time_utc,
+            },
+        )
+        for e in committed:
+            conn.execute(
+                S.events.insert().values(
+                    run_id=e.run_id,
+                    seq=e.seq,
+                    sim_time_utc=e.sim_time_utc,
+                    phase=e.phase,
+                    type=e.type,
+                    payload=e.payload,
+                    payload_hash=e.payload_hash,
+                    previous_hash=e.previous_hash,
+                    event_hash=e.event_hash,
                 )
-                conn.execute(
-                    S.events.insert().values(
-                        run_id=e.run_id,
-                        seq=e.seq,
-                        sim_time_utc=e.sim_time_utc,
-                        phase=e.phase,
-                        type=e.type,
-                        payload=e.payload,
-                        payload_hash=e.payload_hash,
-                        previous_hash=e.previous_hash,
-                        event_hash=e.event_hash,
-                    )
-                )
-            except sa.exc.IntegrityError as exc:
-                raise LedgerError("SEQUENCE_MISMATCH") from exc
-            for ob in outbox or []:
-                conn.execute(
-                    S.outbox.insert().values(
-                        run_id=e.run_id,
-                        event_seq=e.seq,
-                        topic=ob["topic"],
-                        payload=ob["payload"],
-                    )
-                )
+            )
             if e.type == "RUN_ENDED":
-                # Terminal status: the event is committed in this txn, so the
-                # run row's status transitions atomically with the ledger.
                 conn.execute(
-                    sa.text("UPDATE runs SET status='COMPLETED' WHERE run_id=:r"),
-                    {"r": e.run_id},
+                    S.runs.update()
+                    .where(S.runs.c.run_id == run_id)
+                    .values(
+                        status=str(e.payload.get("status", "COMPLETED")),
+                        ended_at_utc=e.sim_time_utc,
+                    )
                 )
-            return e
+        for ob in outbox or []:
+            conn.execute(
+                S.outbox.insert().values(
+                    run_id=run_id, event_seq=seq, topic=ob["topic"], payload=ob["payload"]
+                )
+            )
+        return committed
 
     def events(self, run_id: str) -> list[Event]:
         with self._engine.connect() as conn:
@@ -149,29 +161,26 @@ class PostgresObservationLedger:
     def put_atom(self, atom: Atom) -> None:
         for t in (atom.published_at, atom.available_at, atom.subject_at):
             aware_check(t)
-        # Atoms are content-addressed: the same atom_id is the same atom, so
-        # re-put (e.g. a macro atom delivered at many barriers) is a no-op.
-        from sqlalchemy.dialects.postgresql import insert as pg_insert
-
+        # The corpus is shared across runs: serialize on atom identity, not
+        # run identity, and reject conflicting provenance instead of masking it.
         with self._engine.begin() as conn:
             conn.execute(
-                pg_insert(S.atoms)
-                .values(
-                    atom_id=atom.atom_id,
-                    metric=atom.metric,
-                    value=atom.value,
-                    unit=atom.unit,
-                    kind=atom.kind,
-                    published_at=atom.published_at,
-                    available_at=atom.available_at,
-                    subject_at=atom.subject_at,
-                    source_checked=atom.source_checked,
-                    recipients=list(atom.recipients),
-                    dependencies=list(atom.dependencies),
-                    transform=atom.transform,
-                )
-                .on_conflict_do_nothing(index_elements=["atom_id"])
+                sa.text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
+                {"key": f"atom:{atom.atom_id}"},
             )
+            row = (
+                conn.execute(sa.select(S.atoms).where(S.atoms.c.atom_id == atom.atom_id))
+                .mappings()
+                .first()
+            )
+            if row is not None:
+                values = dict(row)
+                values["recipients"] = tuple(values["recipients"])
+                values["dependencies"] = tuple(values["dependencies"])
+                if Atom(**values) != atom:
+                    raise HarnessError("ATOM_IDENTITY_CONFLICT")
+                return
+            conn.execute(S.atoms.insert().values(**asdict(atom)))
 
     def atoms(self) -> dict[str, Atom]:
         with self._engine.connect() as conn:
@@ -207,6 +216,7 @@ class PostgresObservationLedger:
 
         with self._engine.begin() as conn:
             _scope(conn, run_id)
+            conn.execute(sa.text("SELECT pg_advisory_xact_lock(hashtext(:r))"), {"r": run_id})
             arow = conn.execute(
                 sa.select(
                     S.atoms.c.available_at,
@@ -264,6 +274,7 @@ class PostgresObservationLedger:
             raise LedgerError("ASSESSMENT_RUN_SCOPE_REQUIRED")
         with self._engine.begin() as conn:
             _scope(conn, rec.run_id)
+            conn.execute(sa.text("SELECT pg_advisory_xact_lock(hashtext(:r))"), {"r": rec.run_id})
             exists = conn.execute(
                 sa.select(S.assessments.c.id).where(
                     (S.assessments.c.run_id == rec.run_id)

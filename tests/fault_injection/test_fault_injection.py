@@ -60,8 +60,15 @@ def test_payload_bitflip_breaks_chain() -> None:
     evs = _log()
     e = evs[2]
     evs[2] = Event(
-        e.run_id, e.seq, e.sim_time_utc, e.phase, e.type,
-        {"k": "tampered"}, e.payload_hash, e.previous_hash, e.event_hash,
+        e.run_id,
+        e.seq,
+        e.sim_time_utc,
+        e.phase,
+        e.type,
+        {"k": "tampered"},
+        e.payload_hash,
+        e.previous_hash,
+        e.event_hash,
     )
     assert verify_hash_chain(evs) is False
 
@@ -70,8 +77,15 @@ def test_genesis_link_rewrite_detected() -> None:
     evs = _log()
     e = evs[0]
     evs[0] = Event(
-        e.run_id, e.seq, e.sim_time_utc, e.phase, e.type,
-        e.payload, e.payload_hash, "forged-genesis", e.event_hash,
+        e.run_id,
+        e.seq,
+        e.sim_time_utc,
+        e.phase,
+        e.type,
+        e.payload,
+        e.payload_hash,
+        "forged-genesis",
+        e.event_hash,
     )
     assert verify_hash_chain(evs) is False
 
@@ -120,15 +134,14 @@ def _tape_rec(i: int) -> dict:
     }
 
 
-def test_torn_tail_tolerated(tmp_path: Path) -> None:
-    """An append torn mid-write leaves a truncated LAST line — tolerated, same
-    as DecisionTape's reader."""
+def test_torn_tail_is_an_audit_finding(tmp_path: Path) -> None:
+    """A readable prefix does not make a torn tape complete audit evidence."""
     tape = tmp_path / "decision_tape.jsonl"
     tape.write_text(
         "\n".join(json.dumps(_tape_rec(i)) for i in range(3)) + '\n{"request_hash": "par'
     )
     violations = egress_scan_packets(tape, "r-1")
-    assert violations == []
+    assert any(v["code"] == "TAPE_TORN" for v in violations)
 
 
 def test_midfile_tear_is_a_finding(tmp_path: Path) -> None:

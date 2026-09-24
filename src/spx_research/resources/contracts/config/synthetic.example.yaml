@@ -1,0 +1,42 @@
+# FICTITIOUS SOFTWARE FIXTURE ONLY.
+schema_version: '2.0'
+profile_id: synthetic_accounting_fixture_v2
+mode: synthetic_test
+permissions:
+  real_data_requests: false
+  real_model_requests: false
+  broker_writes: false
+clock:
+  market_resolution_seconds: 60
+  agent_review_minutes: 15
+  timezone: America/New_York
+  simulated_execution_delay_seconds: 60
+portfolio:
+  initial_capital_usd: '10000.00'
+  max_open_or_reserved_slots: 3
+  bullish_weight: 2
+  bearish_weight: 1
+  max_per_spread_initial_risk_usd: '1000.00'
+  max_aggregate_committed_risk_usd: '3000.00'
+  reservation_buffer_usd: '10.00'
+  cross_spread_margin_offsets: false
+fixture:
+  description: Ten-point one-lot credit spread; two-point credit; 1.30-point close
+  multiplier: 100
+  width_index_points: '10.00'
+  initial_credit_index_points: '2.00'
+  final_debit_index_points: '1.30'
+  opening_fee_per_leg_usd: '1.00'
+  closing_fee_per_leg_usd: '1.00'
+  expected_gross_max_profit_usd: '200.00'
+  expected_gross_max_expiration_loss_usd: '800.00'
+  expected_net_closed_pnl_usd: '66.00'
+  expected_final_cash_usd: '10066.00'
+  expected_profit_fraction_of_gross_credit: '0.33'
+models:
+  provider: mock
+  experiment_api_budget_usd: '0.00'
+harness:
+  view_mode: asof_blinded
+  claim_parametric_ignorance: false
+  real_calls: false

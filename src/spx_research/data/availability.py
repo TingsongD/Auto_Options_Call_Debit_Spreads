@@ -7,13 +7,16 @@ separate rows; the gateway returns what was visible, preserving earlier values.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+import hashlib
+import json
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
 import duckdb
 
+from spx_research.domain.results import MarketCoverage
 from spx_research.domain.types import require_aware
 
 NY = ZoneInfo("America/New_York")
@@ -23,13 +26,96 @@ class AvailabilityError(ValueError):
     pass
 
 
+def validate_archive(
+    dataset_root: str | Path,
+    *,
+    expected_kind: str | None = None,
+    expected_manifest_id: str | None = None,
+    expected_calendar_id: str | None = None,
+) -> dict[str, Any]:
+    """Verify the exact immutable files that Archive can read.
+
+    Type checks include synthetic provenance in the actual quote rows; changing
+    a manifest label cannot turn provider data into a synthetic fixture.
+    """
+    root = Path(dataset_root).resolve()
+    try:
+        manifest = json.loads((root / "manifest.json").read_text())
+    except (OSError, ValueError) as exc:
+        raise AvailabilityError("INVALID_DATA_MANIFEST") from exc
+    if not isinstance(manifest, dict):
+        raise AvailabilityError("INVALID_DATA_MANIFEST")
+    kind = manifest.get("dataset_kind")
+    if kind not in ("synthetic", "provider") or (expected_kind and kind != expected_kind):
+        raise AvailabilityError("DATASET_KIND_MISMATCH")
+    if expected_manifest_id and manifest.get("manifest_id") != expected_manifest_id:
+        raise AvailabilityError("DATA_MANIFEST_MISMATCH")
+    if expected_calendar_id and manifest.get("calendar_manifest_id") != expected_calendar_id:
+        raise AvailabilityError("CALENDAR_MANIFEST_MISMATCH")
+    if not isinstance(manifest.get("manifest_id"), str):
+        raise AvailabilityError("INVALID_DATA_MANIFEST")
+    listed: set[Path] = set()
+    con = duckdb.connect(database=":memory:")
+    try:
+        for rec in [*manifest.get("raw_files", []), *manifest.get("normalized_files", [])]:
+            if type(rec.get("rows")) is not int or rec["rows"] < 0:
+                raise AvailabilityError("INVALID_MANIFEST_ROW_COUNT")
+            path = (root / rec["path"]).resolve()
+            if not path.is_relative_to(root) or path in listed or not path.is_file():
+                raise AvailabilityError("MANIFEST_FILE_INVALID")
+            listed.add(path)
+            digest = hashlib.sha256()
+            with path.open("rb") as fh:
+                for block in iter(lambda: fh.read(1024 * 1024), b""):
+                    digest.update(block)
+            if digest.hexdigest() != rec.get("sha256") or path.stat().st_size != rec.get("bytes"):
+                raise AvailabilityError("MANIFEST_CHECKSUM_MISMATCH")
+            if path.suffix == ".parquet":
+                result = con.execute("SELECT COUNT(*) FROM read_parquet(?)", [str(path)]).fetchone()
+                if result is None or result[0] != rec.get("rows"):
+                    raise AvailabilityError("MANIFEST_ROW_COUNT_MISMATCH")
+        actual = {p.resolve() for p in root.rglob("*.parquet")}
+        if not actual or actual - listed or root / "meta/contracts.parquet" not in listed:
+            raise AvailabilityError("UNMANIFESTED_OR_MISSING_DATA")
+        quote_files = sorted(root.glob("quotes/session=*.parquet"))
+        if not quote_files:
+            raise AvailabilityError("MISSING_QUOTE_PARTITIONS")
+        if kind == "synthetic":
+            if manifest.get("provider") != "synthetic":
+                raise AvailabilityError("SYNTHETIC_PROVENANCE_MISMATCH")
+            for path in quote_files:
+                bad = con.execute(
+                    "SELECT COUNT(*) FROM read_parquet(?) "
+                    "WHERE quality_flags IS NULL OR NOT list_contains(quality_flags, 'SYNTHETIC')",
+                    [str(path)],
+                ).fetchone()
+                if bad and bad[0]:
+                    raise AvailabilityError("SYNTHETIC_PROVENANCE_MISMATCH")
+        elif manifest.get("provider") == "synthetic":
+            raise AvailabilityError("DATASET_KIND_MISMATCH")
+        date.fromisoformat(manifest["historical_start"])
+        date.fromisoformat(manifest["historical_end"])
+    except (KeyError, TypeError, ValueError, duckdb.Error) as exc:
+        if isinstance(exc, AvailabilityError):
+            raise
+        raise AvailabilityError("INVALID_DATA_MANIFEST") from exc
+    finally:
+        con.close()
+    return manifest
+
+
 class Archive:
     """Read-side view of one immutable dataset root."""
 
-    def __init__(self, dataset_root: str | Path) -> None:
+    def __init__(self, dataset_root: str | Path, *, verify: bool = True) -> None:
         self.root = Path(dataset_root)
         if not (self.root / "manifest.json").is_file():
             raise AvailabilityError(f"no manifest.json under {self.root}")
+        self.manifest = (
+            validate_archive(self.root)
+            if verify
+            else json.loads((self.root / "manifest.json").read_text())
+        )
         self._con = duckdb.connect(database=":memory:")
         self._quotes_key: str | None = None
         self._static: set[str] = set()
@@ -48,7 +134,7 @@ class Archive:
             return False
         if self._quotes_key != path.name:
             self._con.execute("DROP TABLE IF EXISTS _quotes")
-            self._con.execute(f"CREATE TABLE _quotes AS SELECT * FROM '{path}'")
+            self._con.execute("CREATE TABLE _quotes AS SELECT * FROM read_parquet(?)", [str(path)])
             self._quotes_key = path.name
         return True
 
@@ -64,7 +150,9 @@ class Archive:
             return True
         if not list(self.root.glob(glob)):
             return False
-        self._con.execute(f"CREATE TABLE _{name} AS SELECT * FROM '{self.root}/{glob}'")
+        self._con.execute(
+            f"CREATE TABLE _{name} AS SELECT * FROM read_parquet(?)", [str(self.root / glob)]
+        )
         self._static.add(name)
         return True
 
@@ -84,9 +172,28 @@ class Archive:
         if not self._ensure_static("contracts", "meta/contracts.parquet"):
             return []
         return self._q(
-            "SELECT * FROM _contracts WHERE first_verified_observation_utc <= ?",
+            "SELECT * FROM _contracts "
+            "WHERE coalesce(first_verified_observation_utc, listed_at_utc) <= ? "
+            "ORDER BY contract_id",
             [as_of],
         )
+
+    def session_health(self, as_of: datetime, max_age_seconds: int = 300) -> MarketCoverage:
+        """Coverage is separate from the candidate filter, including an empty partition."""
+        as_of = require_aware(as_of)
+        if not self._ensure_session_quotes(as_of):
+            return "MISSING_SESSION"
+        rows = self._q(
+            "SELECT max(snapshot_at_utc) AS latest FROM _quotes "
+            "WHERE simulated_available_at_utc <= ?",
+            [as_of],
+        )
+        latest = rows[0]["latest"]
+        if latest is None:
+            return "NO_AVAILABLE_QUOTES"
+        if (as_of - latest).total_seconds() > max_age_seconds:
+            return "COVERAGE_OUTAGE"
+        return "HEALTHY"
 
     def _session_quotes_path(self, as_of: datetime) -> Path:
         """Partition for the NY session containing ``as_of`` (no overnight fill)."""
@@ -106,7 +213,8 @@ class Archive:
         rows = self._q(
             "SELECT * FROM _quotes "
             "WHERE contract_id = ? AND simulated_available_at_utc <= ? "
-            "ORDER BY snapshot_at_utc DESC LIMIT 1",
+            "AND snapshot_at_utc <= simulated_available_at_utc "
+            "ORDER BY snapshot_at_utc DESC, simulated_available_at_utc DESC LIMIT 1",
             [contract_id, as_of],
         )
         row = rows[0] if rows else None
@@ -132,8 +240,9 @@ class Archive:
         rows = self._q(
             f"SELECT * FROM _quotes WHERE contract_id IN ({marks}) "
             "AND simulated_available_at_utc <= ? "
+            "AND snapshot_at_utc <= simulated_available_at_utc "
             "QUALIFY row_number() OVER (PARTITION BY contract_id "
-            "ORDER BY snapshot_at_utc DESC) = 1",
+            "ORDER BY snapshot_at_utc DESC, simulated_available_at_utc DESC) = 1",
             [*contract_ids, as_of],
         )
         if max_age_seconds is not None:
@@ -150,7 +259,9 @@ class Archive:
             return None
         rows = self._q(
             "SELECT * FROM _index "
-            "WHERE simulated_available_at_utc <= ? ORDER BY observed_at_utc DESC LIMIT 1",
+            "WHERE simulated_available_at_utc <= ? "
+            "AND observed_at_utc <= simulated_available_at_utc "
+            "ORDER BY observed_at_utc DESC, simulated_available_at_utc DESC LIMIT 1",
             [as_of],
         )
         return rows[0] if rows else None
@@ -165,7 +276,9 @@ class Archive:
             return None
         rows = self._q(
             "SELECT * FROM _greeks WHERE contract_id = ? "
-            "AND simulated_available_at_utc <= ? ORDER BY asof_utc DESC LIMIT 1",
+            "AND simulated_available_at_utc <= ? "
+            "AND asof_utc <= simulated_available_at_utc "
+            "ORDER BY asof_utc DESC, simulated_available_at_utc DESC LIMIT 1",
             [contract_id, as_of],
         )
         row = rows[0] if rows else None
@@ -186,6 +299,8 @@ class Archive:
             return []
         sql = (
             "SELECT * FROM _macro WHERE simulated_available_at_utc <= ?"
+            " AND (public_release_at_utc IS NULL "
+            "OR public_release_at_utc <= simulated_available_at_utc)"
             + (" AND series_id = ?" if series_id else "")
             + " ORDER BY simulated_available_at_utc"
         )
@@ -195,9 +310,7 @@ class Archive:
     def settlement_for(self, expiry: Any) -> dict[str, Any] | None:
         if not self._ensure_static("settlements", "meta/settlements.parquet"):
             return None
-        rows = self._q(
-            "SELECT * FROM _settlements WHERE expiry_local_date = ? LIMIT 1", [expiry]
-        )
+        rows = self._q("SELECT * FROM _settlements WHERE expiry_local_date = ? LIMIT 1", [expiry])
         return rows[0] if rows else None
 
     def close(self) -> None:

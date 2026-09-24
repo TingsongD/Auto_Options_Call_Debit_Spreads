@@ -37,7 +37,11 @@ class PackageOrder:
         require_aware(self.first_eligible_at_utc)
         if self.first_eligible_at_utc <= self.submitted_at_utc:
             raise DomainError("NO_EXECUTION_DELAY")
-        if self.limit_points <= 0:
+        if (
+            not self.limit_points.is_finite()
+            or self.limit_points < 0
+            or (self.intent is Intent.OPEN and self.limit_points == 0)
+        ):
             raise DomainError("NONPOSITIVE_LIMIT")
 
 

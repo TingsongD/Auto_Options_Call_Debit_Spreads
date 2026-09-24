@@ -36,6 +36,6 @@ def require_settlement_value(value: Decimal | None) -> Decimal:
     """T36: hold-to-expiry cannot be validated without a verified value."""
     if value is None:
         raise DomainError("MISSING_SETTLEMENT_VALUE")
-    if value < 0:
+    if not value.is_finite() or value < 0:
         raise DomainError("NEGATIVE_SETTLEMENT_VALUE")
     return value

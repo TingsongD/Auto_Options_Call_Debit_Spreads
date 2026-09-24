@@ -46,7 +46,7 @@ def _write_run(dir_path: Path, run_id: str, n: int = 3, tamper: bool = False) ->
     (dir_path / "report.json").write_text(json.dumps({"final_cash_usd": "10000"}))
 
 
-def test_registry_dedupes_by_lineage(tmp_path):
+def test_registry_preserves_runs_sharing_lineage(tmp_path):
     reg_path = tmp_path / "registry.jsonl"
     reg = ExperimentRegistry(reg_path)
     profile = tmp_path / "p.yaml"
@@ -56,7 +56,7 @@ def test_registry_dedupes_by_lineage(tmp_path):
     assert a.experiment_id == b.experiment_id  # same lineage -> same experiment
     c = reg.register("run-3", profile_path=profile, model_id="gpt-x", code_version="abc")
     assert c.experiment_id != a.experiment_id  # model drift -> new experiment
-    assert len(ExperimentRegistry(reg_path).list()) == 2
+    assert len(ExperimentRegistry(reg_path).list()) == 3
     assert a.study_label == STUDY_LABEL
 
 
@@ -68,6 +68,8 @@ def test_hash_chain_and_replay_report(tmp_path):
     assert rep["checks"]["replay_ok"] is True
     assert rep["classification"] == STUDY_LABEL
     assert rep["parametric_ignorance_proven"] is False
+    assert rep["application_temporal_gate"] == "NOT_RUN"
+    assert rep["success"] is False
 
 
 def test_tampered_log_detected(tmp_path):
@@ -83,9 +85,10 @@ def test_compare_runs_invariance(tmp_path):
     _write_run(a, "r-same")  # same run_id + payloads -> identical digest
     _write_run(b, "r-same")
     res = compare_runs(a, b)
-    assert res["invariant"] is True
+    assert res["invariant"] is None  # financial equality cannot establish request invariance
+    assert res["success"] is False
     _write_run(b, "r-diff", tamper=True)
-    assert compare_runs(a, b)["invariant"] is False
+    assert compare_runs(a, b)["success"] is False
 
 
 def test_egress_scan_tape(tmp_path):

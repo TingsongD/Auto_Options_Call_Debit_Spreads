@@ -10,12 +10,14 @@ precondition for future-suffix invariance.
 from __future__ import annotations
 
 from datetime import datetime
+from decimal import Decimal
+from typing import Any
 
 from spx_research.engine.policy import ManagerView, SpreadView
 from spx_research.epistemics.egress import egress_check
 from spx_research.epistemics.harness import Harness, digest
 from spx_research.epistemics.store import ObservationLedger
-from spx_research.epistemics.types import VOCAB, Atom, Compiled, Context, MenuChoice
+from spx_research.epistemics.types import VOCAB, Atom, Compiled, Context, HarnessError, MenuChoice
 
 
 def atom_id_for(metric: str, value: str, unit: str, kind: str, available_at: datetime) -> str:
@@ -43,15 +45,43 @@ def _deliver_all(
         ledger.deliver(run_id, branch_id, actor_id, a.atom_id, at)
 
 
+def _risk_fraction(loss: Decimal, equity: Decimal | None) -> Decimal:
+    if equity is None or not equity.is_finite() or equity <= 0:
+        raise HarnessError("MISSING_POSITIVE_EQUITY")
+    return loss / equity
+
+
 def spread_atoms(view: SpreadView, as_of: datetime) -> list[Atom]:
-    """Facts a spread agent is entitled to at its review (all relative)."""
-    out: list[Atom] = []
-    out.append(_atom("available_slots", "0" if view.position else "1", as_of))
+    """Recipient-scoped economics and frozen advisory rules, without dates."""
+    out = [_atom("available_slots", "0" if view.position else "1", as_of)]
+    if view.agent.direction is not None:
+        out.append(_atom("direction_mandate", view.agent.direction.value, as_of))
+    for metric, value in (
+        ("days_held", view.days_held),
+        ("profit_band_low", view.advisory_profit_low),
+        ("profit_band_high", view.advisory_profit_high),
+        ("loss_band_low", view.advisory_loss_low),
+        ("loss_band_high", view.advisory_loss_high),
+        ("loss_activation_days", view.loss_activation_days),
+        ("advisory_rule", "DISCRETIONARY"),
+    ):
+        out.append(_atom(metric, str(value), as_of))
+    if view.as_of_dte is not None:
+        out.append(_atom("dte", str(view.as_of_dte), as_of))
     if view.position is not None and view.profit_fraction is not None:
         out.append(_atom("profit_fraction", str(view.profit_fraction), as_of))
     for c in view.candidates:
-        out.append(_atom("candidate_max_risk", str(c.max_loss_usd), as_of))
+        out.append(
+            _atom("candidate_max_risk", str(_risk_fraction(c.max_loss_usd, view.equity_usd)), as_of)
+        )
+    out.extend(_macro_atoms(view.macro_facts))
     return out
+
+
+def _attributes(**values: object) -> tuple[tuple[str, str, str], ...]:
+    return tuple(
+        (name, str(value), VOCAB[name][0]) for name, value in values.items() if value is not None
+    )
 
 
 def spread_menu(view: SpreadView, atoms: list[Atom]) -> list[MenuChoice]:
@@ -73,6 +103,25 @@ def spread_menu(view: SpreadView, atoms: list[Atom]) -> list[MenuChoice]:
                     req,
                     target_internal_id=c.candidate_id,
                     limit_internal_id=tpl.template_id,
+                    attributes=_attributes(
+                        direction_mandate=c.direction.value,
+                        dte=c.dte,
+                        spread_width=c.spread.width_points,
+                        credit_to_width=c.credit_points / c.spread.width_points,
+                        limit_to_width=tpl.limit_points / c.spread.width_points,
+                        candidate_max_risk=_risk_fraction(c.max_loss_usd, view.equity_usd),
+                        short_delta=c.short_delta,
+                        short_moneyness=(
+                            Decimal(c.spread.short.strike_points) / view.spot_points
+                            if view.spot_points
+                            else None
+                        ),
+                        long_moneyness=(
+                            Decimal(c.spread.long.strike_points) / view.spot_points
+                            if view.spot_points
+                            else None
+                        ),
+                    ),
                 )
             )
     elif view.position is not None:
@@ -94,6 +143,10 @@ def spread_menu(view: SpreadView, atoms: list[Atom]) -> list[MenuChoice]:
                     base,
                     target_internal_id=view.position.position_id,
                     limit_internal_id=tpl.template_id,
+                    attributes=_attributes(
+                        limit_to_width=tpl.limit_points / view.position.spread.width_points,
+                        spread_width=view.position.spread.width_points,
+                    ),
                 )
             )
     return menu
@@ -126,10 +179,37 @@ def manager_atoms(view: ManagerView, as_of: datetime) -> list[Atom]:
             as_of,
         ),
     ]
-    for fact in view.macro_facts:
+    out.extend(_macro_atoms(view.macro_facts))
+    if view.equity_usd is not None and view.equity_usd.is_finite() and view.equity_usd > 0:
+        out.append(
+            _atom(
+                "available_risk_fraction",
+                str(_risk_fraction(view.available_usd, view.equity_usd)),
+                as_of,
+            )
+        )
+    out.append(_atom("bullish_count", str(view.active_bullish + view.reserved_bullish), as_of))
+    out.append(_atom("bearish_count", str(view.active_bearish + view.reserved_bearish), as_of))
+    return out
+
+
+def _macro_atoms(facts: tuple[dict[str, Any], ...]) -> list[Atom]:
+    out: list[Atom] = []
+    for fact in facts:
         unit, _allowed = VOCAB[fact["metric"]]
-        aid = atom_id_for(
-            fact["metric"], str(fact["value"]), unit, "OBSERVATION", fact["available_at"]
+        # Bind all provenance fields, not merely value+availability.
+        aid = (
+            "atm_"
+            + digest(
+                [
+                    fact["metric"],
+                    str(fact["value"]),
+                    unit,
+                    fact["published_at"].isoformat(),
+                    fact["available_at"].isoformat(),
+                    fact["subject_at"].isoformat(),
+                ]
+            )[:24]
         )
         out.append(
             Atom(

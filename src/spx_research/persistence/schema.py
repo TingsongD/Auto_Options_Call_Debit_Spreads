@@ -90,6 +90,14 @@ assessments = sa.Table(
     sa.Column("premise_atom_ids", sa.JSON, nullable=False),
     sa.Column("accepted_at", sa.DateTime(timezone=True), nullable=False),
     sa.Column("decision_token", sa.Text, nullable=False),
+    sa.UniqueConstraint(
+        "run_id",
+        "branch_id",
+        "actor_id",
+        "decision_token",
+        "topic",
+        name="uq_assessment_decision_topic",
+    ),
 )
 
 incidents = sa.Table(
@@ -129,6 +137,103 @@ checkpoints = sa.Table(
     sa.Column("at_utc", sa.DateTime(timezone=True), nullable=False),
 )
 
+# Runtime-v2 records are separate from legacy ledgers. Their absence means
+# legacy/read-only replay, never permission to resume from guessed state.
+runtime_runs = sa.Table(
+    "runtime_runs",
+    metadata,
+    sa.Column("run_id", sa.Text, sa.ForeignKey("runs.run_id"), primary_key=True),
+    sa.Column("manifest", sa.JSON, nullable=False),
+    sa.Column("manifest_hash", sa.Text, nullable=False),
+    sa.Column("status", sa.Text, nullable=False),
+    sa.Column("cursor", sa.JSON, nullable=False),
+    sa.Column("pause", sa.JSON),
+    sa.Column("budget_cap", sa.Numeric()),
+    sa.CheckConstraint(
+        "status IN ('RUNNING', 'PAUSED', 'COMPLETED', 'FAILED')", name="ck_runtime_run_status"
+    ),
+    sa.CheckConstraint(
+        "budget_cap >= 0 AND budget_cap < 'Infinity'::numeric", name="ck_runtime_budget_amount"
+    ),
+)
+runtime_decisions = sa.Table(
+    "runtime_decisions",
+    metadata,
+    sa.Column("run_id", sa.Text, sa.ForeignKey("runtime_runs.run_id"), primary_key=True),
+    sa.Column("decision_id", sa.Text, primary_key=True),
+    sa.Column("request_hash", sa.Text, nullable=False),
+    sa.Column("request", sa.JSON, nullable=False),
+    sa.Column("response", sa.JSON),
+    sa.Column("status", sa.Text, nullable=False),
+    sa.Column("result", sa.JSON),
+    sa.Column("accepted_attempt_id", sa.Text),
+    sa.CheckConstraint(
+        "status IN ('PREPARED', 'RESPONSE_RECORDED', 'ACCEPTED')",
+        name="ck_runtime_decision_status",
+    ),
+    sa.ForeignKeyConstraint(
+        ["run_id", "decision_id", "accepted_attempt_id"],
+        ["runtime_attempts.run_id", "runtime_attempts.decision_id", "runtime_attempts.attempt_id"],
+        name="fk_decision_accepted_attempt",
+        use_alter=True,
+    ),
+)
+runtime_attempts = sa.Table(
+    "runtime_attempts",
+    metadata,
+    sa.Column("run_id", sa.Text, sa.ForeignKey("runtime_runs.run_id"), primary_key=True),
+    sa.Column("attempt_id", sa.Text, primary_key=True),
+    sa.Column("decision_id", sa.Text, nullable=False),
+    sa.Column("reserved_usd", sa.Numeric(), nullable=False),
+    sa.Column("actual_usd", sa.Numeric()),
+    sa.Column("outcome", sa.Text, nullable=False),
+    sa.Column("response", sa.JSON),
+    sa.Column("request", sa.JSON),
+    sa.Column("error_code", sa.Text, nullable=False),
+    sa.ForeignKeyConstraint(
+        ["run_id", "decision_id"],
+        ["runtime_decisions.run_id", "runtime_decisions.decision_id"],
+        name="fk_attempt_prepared_decision",
+    ),
+    sa.UniqueConstraint("run_id", "decision_id", "attempt_id", name="uq_attempt_decision_identity"),
+    sa.CheckConstraint(
+        "reserved_usd >= 0 AND reserved_usd < 'Infinity'::numeric",
+        name="ck_runtime_reservation_amount",
+    ),
+    sa.CheckConstraint(
+        "actual_usd >= 0 AND actual_usd < 'Infinity'::numeric", name="ck_runtime_actual_amount"
+    ),
+)
+runtime_barriers = sa.Table(
+    "runtime_barriers",
+    metadata,
+    sa.Column("run_id", sa.Text, sa.ForeignKey("runtime_runs.run_id"), primary_key=True),
+    sa.Column("barrier_id", sa.Text, primary_key=True),
+    sa.Column("expected_seq", sa.BigInteger, nullable=False),
+    sa.Column("request_hashes", sa.JSON, nullable=False),
+    sa.Column("cursor", sa.JSON, nullable=False),
+    sa.Column("batch_hash", sa.Text),
+    sa.Column("last_seq", sa.BigInteger),
+    sa.Column("status", sa.Text, nullable=False),
+)
+runtime_journal = sa.Table(
+    "runtime_journal",
+    metadata,
+    sa.Column("id", sa.BigInteger, sa.Identity(), primary_key=True),
+    sa.Column("run_id", sa.Text, sa.ForeignKey("runtime_runs.run_id"), nullable=False),
+    sa.Column("kind", sa.Text, nullable=False),
+    sa.Column("payload", sa.JSON, nullable=False),
+    sa.Column("at_utc", sa.DateTime(timezone=True), nullable=False),
+)
+event_hash_migration_audit = sa.Table(
+    "event_hash_migration_audit",
+    metadata,
+    sa.Column("run_id", sa.Text, primary_key=True),
+    sa.Column("seq", sa.BigInteger, primary_key=True),
+    sa.Column("original_envelope", sa.JSON, nullable=False),
+    sa.Column("original_sha256", sa.Text, nullable=False),
+)
+
 ALL_TABLES = (
     "runs",
     "events",
@@ -139,4 +244,10 @@ ALL_TABLES = (
     "incidents",
     "costs",
     "checkpoints",
+    "runtime_runs",
+    "runtime_decisions",
+    "runtime_attempts",
+    "runtime_barriers",
+    "runtime_journal",
+    "event_hash_migration_audit",
 )

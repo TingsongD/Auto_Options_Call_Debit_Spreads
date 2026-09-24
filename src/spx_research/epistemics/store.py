@@ -70,6 +70,8 @@ class InMemoryObservationLedger:
     def put_atom(self, atom: Atom) -> None:
         for t in (atom.published_at, atom.available_at, atom.subject_at):
             aware_check(t)
+        if atom.atom_id in self._atoms and self._atoms[atom.atom_id] != atom:
+            raise HarnessError("ATOM_IDENTITY_CONFLICT")
         self._atoms[atom.atom_id] = atom
 
     def atoms(self) -> dict[str, Atom]:

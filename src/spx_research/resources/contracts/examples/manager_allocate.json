@@ -1,0 +1,21 @@
+{
+  "schema_version": "2.1",
+  "actor_role": "MANAGER",
+  "decision_token": "dec_manager",
+  "packet_token": "pkt_manager",
+  "prior_belief_token": "bel_manager",
+  "action_id": "act_allocate",
+  "premise_tokens": [
+    "ev_slots",
+    "ev_ratio"
+  ],
+  "assessment_updates": [],
+  "reason_codes": [
+    "ALLOCATION_DEFICIT"
+  ],
+  "uncertainty_codes": [
+    "UNKNOWN_FUTURE_POLICY_PATH",
+    "UNKNOWN_FUTURE_PRICE_PATH"
+  ],
+  "confidence_label": "MEDIUM"
+}

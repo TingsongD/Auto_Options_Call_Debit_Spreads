@@ -8,6 +8,9 @@ keep every external permission disabled.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import time
+from decimal import Decimal
+from typing import Any
 
 from spx_research.config import Profile
 
@@ -30,6 +33,7 @@ _REQUIRED_FOR_RESEARCH: tuple[tuple[str, str, str], ...] = (
     ("execution", "opening_fee_per_leg_usd", "opening fees must be explicit"),
     ("execution", "closing_fee_per_leg_usd", "closing fees must be explicit"),
     ("execution", "settlement_fee_profile_id", "settlement fees must be explicit"),
+    ("execution", "settlement_fee_per_leg_usd", "numeric settlement fees must be explicit"),
     ("execution", "settlement_cash_availability_policy_id", "settlement cash timing policy"),
     ("clock", "calendar_manifest_id", "versioned exchange calendar required"),
     ("study", "data_manifest_id", "immutable data manifest required"),
@@ -62,6 +66,7 @@ _REQUIRED_APPROVALS: tuple[tuple[str, str], ...] = (
 def check(profile: Profile) -> list[Finding]:
     """Return preflight findings for the profile's declared mode."""
     findings: list[Finding] = []
+    _check_supported(profile, findings)
     if profile.mode == "synthetic_test":
         return _check_synthetic(profile, findings)
     return _check_research(profile, findings)
@@ -168,3 +173,91 @@ def _check_research(profile: Profile, findings: list[Finding]) -> list[Finding]:
 
 def blocking(findings: list[Finding]) -> list[Finding]:
     return [f for f in findings if f.severity == "BLOCK"]
+
+
+def _check_supported(profile: Profile, findings: list[Finding]) -> None:
+    supported: dict[str, dict[str, Any]] = {
+        "execution": {
+            "reference_model": "natural_quote_sides",
+            "order_style": "package_limit",
+            "fill_window": "first_eligible_minute_only",
+            "require_both_legs_same_snapshot": True,
+            "require_relevant_side_size_at_least": 1,
+            "no_overnight_quote_forward_fill": True,
+            "quote_event_age_policy": "known_age_limit_else_disclose_snapshot_only",
+            "settlement_cash_availability_policy_id": (None, "immediate_on_verified_publication"),
+        },
+        "clock": {
+            "review_anchor": "session_open_plus_review_interval",
+            "respect_half_days": True,
+            "research_session_open": time(9, 30),
+            "research_session_close": time(16, 0),
+            "out_of_cycle_spread_reviews": False,
+        },
+        "portfolio": {
+            "capital_model": "full_width_cash_encumbrance",
+            "ratio_is_soft_target": True,
+            "no_forced_trade_for_ratio": True,
+        },
+        "exit_policy": {
+            "mandatory_loss_stop_enabled": False,
+            "mandatory_exit_before_dte": None,
+            "holding_age_basis": "new_york_calendar_date_difference",
+            "pnl_numerator": "net_estimated_liquidation_pnl",
+            "profit_denominator": "gross_initial_credit",
+            "loss_denominator": "gross_initial_credit",
+            "early_discretionary_exit_allowed": True,
+            "may_hold_beyond_profit_band": True,
+        },
+        "manager": {
+            "triggers": ["first_daily_review", "fills_or_closures", "reservation_expiry"],
+            "coalesce_events_by_minute": True,
+            "reservation_expiry": "research_session_close",
+            "new_agent_first_action": "next_regular_agent_review",
+        },
+        "study": {"final_position_policy": "runoff_to_close_or_settlement"},
+        "quality": {
+            "missing_open_position_quote": "pause_validated_run",
+            "invalid_candidate_quote": "reject_candidate_and_report",
+            "coverage_outage": "pause_not_no_trade",
+            "fail_on_future_feature": True,
+            "fail_on_missing_settlement_value": True,
+        },
+    }
+    for section_name, values in supported.items():
+        section = getattr(profile, section_name)
+        if section is None:
+            continue
+        for name, expected in values.items():
+            value = getattr(section, name)
+            allowed = expected if isinstance(expected, tuple) else (expected,)
+            if value not in allowed:
+                findings.append(
+                    Finding(
+                        "BLOCK",
+                        "UNSUPPORTED_SETTING",
+                        f"{section_name}.{name}",
+                        "the engine does not implement this setting",
+                    )
+                )
+    for section_name in ("portfolio", "execution", "models", "quality", "universe", "exit_policy"):
+        section = getattr(profile, section_name)
+        if section is None:
+            continue
+        for name, value in section.__dict__.items():
+            if isinstance(value, Decimal) and (not value.is_finite() or value < 0):
+                findings.append(
+                    Finding(
+                        "BLOCK",
+                        "INVALID_NUMBER",
+                        f"{section_name}.{name}",
+                        "must be finite and nonnegative",
+                    )
+                )
+    if profile.study:
+        s = profile.study
+        dates = [d for d in (s.start_date, s.scored_end_date, s.runoff_end_date) if d is not None]
+        if dates != sorted(dates):
+            findings.append(
+                Finding("BLOCK", "INVALID_BOUNDARIES", "study", "dates are out of order")
+            )

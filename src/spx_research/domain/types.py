@@ -63,14 +63,26 @@ class Contract:
     def __post_init__(self) -> None:
         if self.root not in ("SPX", "SPXW"):
             raise DomainError("UNSUPPORTED_ROOT")
-        if self.multiplier <= 0:
+        if isinstance(self.multiplier, bool) or self.multiplier <= 0:
             raise DomainError("BAD_MULTIPLIER")
-        if self.strike_points <= 0 or self.price_increment <= 0:
+        if (
+            not self.strike_points.is_finite()
+            or not self.price_increment.is_finite()
+            or self.strike_points <= 0
+            or self.price_increment <= 0
+        ):
             raise DomainError("BAD_PRICE")
-        if self.listed_at_utc is not None:
-            require_aware(self.listed_at_utc)
-        if self.settlement_event_at_utc is not None:
-            require_aware(self.settlement_event_at_utc)
+        if self.exercise_style != "EUROPEAN" or self.settlement_style != "PM":
+            raise DomainError("UNSUPPORTED_SETTLEMENT_CONVENTION")
+        for name in (
+            "listed_at_utc",
+            "first_verified_observation_utc",
+            "last_trading_at_utc",
+            "settlement_event_at_utc",
+        ):
+            value = getattr(self, name)
+            if value is not None:
+                object.__setattr__(self, name, require_aware(value))
 
     def available_at(self, t: datetime) -> bool:
         """Conservative listing visibility (T04): first verified observation."""
@@ -94,6 +106,7 @@ class CreditSpread:
         s, lo = self.short, self.long
         for attr in (
             "root",
+            "right",
             "expiration_local_date",
             "exercise_style",
             "settlement_style",
@@ -102,6 +115,8 @@ class CreditSpread:
         ):
             if getattr(s, attr) != getattr(lo, attr):
                 raise DomainError("LEG_MISMATCH")
+        if s.contract_id == lo.contract_id:
+            raise DomainError("SAME_CONTRACT_LEGS")
         if self.direction is Direction.BULL_PUT_CREDIT:
             if s.right is not Right.PUT or not s.strike_points > lo.strike_points:
                 raise DomainError("BAD_BULL_PUT_STRUCTURE")
@@ -141,14 +156,30 @@ class Quote:
     simulated_available_at_utc: datetime
     quote_event_time_known: bool = False
     quality_flags: tuple[str, ...] = ()
+    quote_event_at_utc: datetime | None = None
 
     def __post_init__(self) -> None:
-        require_aware(self.snapshot_at_utc)
-        require_aware(self.simulated_available_at_utc)
+        object.__setattr__(self, "snapshot_at_utc", require_aware(self.snapshot_at_utc))
+        object.__setattr__(
+            self, "simulated_available_at_utc", require_aware(self.simulated_available_at_utc)
+        )
+        if not self.bid_points.is_finite() or not self.ask_points.is_finite():
+            raise DomainError("NONFINITE_PRICE")
         if self.bid_points < 0 or self.ask_points < 0:
             raise DomainError("NEGATIVE_PRICE")
         if self.bid_points > self.ask_points:
             raise DomainError("CROSSED_QUOTE")
+        if self.bid_size_contracts < 0 or self.ask_size_contracts < 0:
+            raise DomainError("NEGATIVE_SIZE")
+        if self.simulated_available_at_utc < self.snapshot_at_utc:
+            raise DomainError("AVAILABILITY_BEFORE_SNAPSHOT")
+        if self.quote_event_time_known != (self.quote_event_at_utc is not None):
+            raise DomainError("INCONSISTENT_QUOTE_EVENT_TIME")
+        if self.quote_event_at_utc is not None:
+            event_time = require_aware(self.quote_event_at_utc)
+            object.__setattr__(self, "quote_event_at_utc", event_time)
+            if event_time > self.snapshot_at_utc:
+                raise DomainError("QUOTE_EVENT_AFTER_SNAPSHOT")
 
     def usable_at(self, t: datetime) -> bool:
         return require_aware(t) >= self.simulated_available_at_utc

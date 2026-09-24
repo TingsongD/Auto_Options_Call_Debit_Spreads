@@ -1,0 +1,69 @@
+{
+  "schema_version": "2.1",
+  "actor_role": "SPREAD",
+  "episode_token": "ep_demo",
+  "decision_token": "dec_entry",
+  "packet_token": "pkt_entry",
+  "prior_belief_token": "bel_demo",
+  "clock": {
+    "session_index": 12,
+    "minute_from_open": 30
+  },
+  "premises": [
+    {
+      "token": "ev_budget",
+      "metric": "candidate_max_risk",
+      "value": "0.08",
+      "unit": "fraction_of_equity",
+      "kind": "DERIVED",
+      "age_minutes": 0
+    },
+    {
+      "token": "ev_slot",
+      "metric": "direction_mandate",
+      "value": "BULL_PUT_CREDIT",
+      "unit": "policy",
+      "kind": "APPROVED_RULE",
+      "age_minutes": 0
+    }
+  ],
+  "assessments": [],
+  "unknowns": [
+    "UNKNOWN_FUTURE_POLICY_PATH",
+    "UNKNOWN_FUTURE_PRICE_PATH"
+  ],
+  "action_menu": [
+    {
+      "action_id": "act_wait",
+      "kind": "WAIT",
+      "target_token": null,
+      "limit_option_token": null,
+      "attributes": [],
+      "required_premise_tokens": [
+        "ev_slot"
+      ]
+    },
+    {
+      "action_id": "act_open",
+      "kind": "OPEN",
+      "target_token": "candidate_demo",
+      "limit_option_token": "limit_entry_demo",
+      "attributes": [
+        {
+          "name": "dte",
+          "value": "45",
+          "unit": "calendar_days"
+        },
+        {
+          "name": "credit_per_width",
+          "value": "0.20",
+          "unit": "fraction"
+        }
+      ],
+      "required_premise_tokens": [
+        "ev_budget",
+        "ev_slot"
+      ]
+    }
+  ]
+}

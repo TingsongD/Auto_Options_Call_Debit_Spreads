@@ -30,6 +30,22 @@ KINDS = {"OBSERVATION", "ANNOUNCEMENT", "SCHEDULE", "SOURCE_FORECAST", "DERIVED"
 # finite Decimal values). A metric's unit is part of its registration; enum
 # metrics list every permitted value explicitly.
 VOCAB: dict[str, tuple[str, frozenset[str] | None]] = {
+    "days_held": ("calendar_days", None),
+    "dte": ("calendar_days", None),
+    "profit_band_low": ("fraction_of_initial_credit", None),
+    "profit_band_high": ("fraction_of_initial_credit", None),
+    "loss_band_low": ("fraction_of_initial_credit", None),
+    "loss_band_high": ("fraction_of_initial_credit", None),
+    "loss_activation_days": ("calendar_days", None),
+    "spread_width": ("index_points", None),
+    "credit_to_width": ("fraction_of_width", None),
+    "limit_to_width": ("fraction_of_width", None),
+    "short_delta": ("delta", None),
+    "short_moneyness": ("strike_over_spot", None),
+    "long_moneyness": ("strike_over_spot", None),
+    "available_risk_fraction": ("fraction_of_equity", None),
+    "bullish_count": ("slots", None),
+    "bearish_count": ("slots", None),
     "policy_rate_bps": ("basis_points", None),
     "policy_delta_bps": ("basis_points", None),
     "expected_rate_bps": ("basis_points", None),
@@ -132,6 +148,7 @@ class MenuChoice:
     required_atoms: tuple[str, ...]
     target_internal_id: str | None = None
     limit_internal_id: str | None = None
+    attributes: tuple[tuple[str, str, str], ...] = ()
 
 
 @dataclass(frozen=True)

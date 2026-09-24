@@ -25,6 +25,8 @@ jobs:
     env:
       SPX_DB_DSN: postgresql+psycopg://spx_dev:spx_dev_local_only@127.0.0.1:5433/spx_research
       SPX_TEST_DSN: postgresql+psycopg://spx_dev:spx_dev_local_only@127.0.0.1:5433/spx_research
+      SPX_REQUIRE_POSTGRES: '1'
+      SPX_TEST_ISOLATION: '1'
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
@@ -34,4 +36,16 @@ jobs:
       - run: uv run ruff check
       - run: uv run mypy src
       - run: uv run spx-research migrate
+      - run: docker pull python:3.12-slim-bookworm
+      - run: docker build --network=none -t spx-inference:2.1 -f Dockerfile.isolation .
       - run: uv run pytest -q
+      - run: uv run python -m unittest discover -s reference -q
+      - run: uv build
+      - name: Verify installed wheel outside checkout
+        run: |
+          uv venv /tmp/spx-installed --python 3.12
+          uv export --frozen --no-dev --no-emit-project -o /tmp/spx-requirements.txt
+          uv pip install --python /tmp/spx-installed/bin/python -c /tmp/spx-requirements.txt dist/*.whl
+          cp scripts/check_installed.py /tmp/check-spx-installed.py
+          cd /tmp
+          env -u SPX_SPEC_DIR /tmp/spx-installed/bin/python check-spx-installed.py

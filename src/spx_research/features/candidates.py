@@ -10,12 +10,14 @@ versioning is part of the strategy (TK25).
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
 
 from spx_research.data.availability import Archive
+from spx_research.data.validation import on_increment, quote_from_row, validate_pair
 from spx_research.domain.types import (
     Contract,
     CreditSpread,
@@ -55,6 +57,9 @@ def _contract(row: dict[str, Any]) -> Contract:
         price_increment=Decimal(str(row["price_increment"])),
         listed_at_utc=row.get("listed_at_utc"),
         first_verified_observation_utc=row.get("first_verified_observation_utc"),
+        last_trading_at_utc=row.get("last_trading_at_utc"),
+        settlement_event_at_utc=row.get("settlement_event_at_utc"),
+        settlement_value_symbol=row.get("settlement_value_symbol"),
     )
 
 
@@ -75,15 +80,26 @@ def build_candidates(
     max_quote_age_seconds: int | None = None,
     max_greek_age_seconds: int | None = None,
     require_validated_greeks: bool = True,
+    max_event_age_seconds: int | None = None,
+    findings: list[dict[str, Any]] | None = None,
 ) -> list[Candidate]:
     """Deterministic eligible shortlist for one direction at one decision time."""
     as_of = require_aware(as_of)
     right = Right.PUT if direction is Direction.BULL_PUT_CREDIT else Right.CALL
-    contracts = [
-        c
-        for c in (_contract(r) for r in archive.contracts_visible_at(as_of))
-        if c.right is right and (not allowed_roots or c.root in allowed_roots)
-    ]
+    contracts = []
+    for row in archive.contracts_visible_at(as_of):
+        try:
+            contract = _contract(row)
+        except (DomainError, ValueError, TypeError, ArithmeticError):
+            if findings is not None:
+                findings.append({"code": "INVALID_CONTRACT", "contract_id": row.get("contract_id")})
+            continue
+        if (
+            contract.right is right
+            and (not allowed_roots or contract.root in allowed_roots)
+            and (contract.last_trading_at_utc is None or as_of < contract.last_trading_at_utc)
+        ):
+            contracts.append(contract)
     eligible: list[Candidate] = []
     for expiry in sorted({c.expiration_local_date for c in contracts}):
         dte = (expiry - ny_date).days
@@ -113,20 +129,43 @@ def build_candidates(
                 lq = quotes.get(long_c.contract_id)
                 if sq is None or lq is None:
                     continue
+                try:
+                    validate_pair(
+                        quote_from_row(sq),
+                        quote_from_row(lq),
+                        as_of,
+                        max_snapshot_age_seconds=max_quote_age_seconds,
+                        max_event_age_seconds=max_event_age_seconds,
+                    )
+                except (DomainError, ValueError, TypeError, ArithmeticError) as exc:
+                    if findings is not None:
+                        code = str(exc) if isinstance(exc, DomainError) else "INVALID_QUOTE_VALUE"
+                        findings.append({"code": code, "contract_id": short_c.contract_id})
+                    continue
                 if sq["bid_size_contracts"] < 1 or lq["ask_size_contracts"] < 1:
                     continue
                 credit = Decimal(str(sq["bid_points"])) - Decimal(str(lq["ask_points"]))
-                if credit <= 0:
+                if credit <= 0 or credit >= w or not on_increment(credit, short_c.price_increment):
                     continue
                 greek = archive.greeks_at(
                     short_c.contract_id, as_of, max_age_seconds=max_greek_age_seconds
                 )
-                delta = None if greek is None else Decimal(str(greek["delta"]))
-                if require_validated_greeks and greek is not None and not greek.get(
-                    "methodology_id"
+                try:
+                    delta = None if greek is None else Decimal(str(greek["delta"]))
+                except (ValueError, TypeError, ArithmeticError):
+                    continue
+                if (
+                    require_validated_greeks
+                    and greek is not None
+                    and not greek.get("methodology_id")
                 ):
                     continue  # unvalidated Greeks never feed the delta filter
-                if delta is None or not delta_range[0] <= abs(delta) <= delta_range[1]:
+                if (
+                    delta is None
+                    or not delta.is_finite()
+                    or not delta_range[0] <= abs(delta) <= delta_range[1]
+                    or set((greek or {}).get("quality_flags") or ()) - {"SYNTHETIC", "VALIDATED"}
+                ):
                     continue  # unvalidated delta is an explicit ineligibility reason
                 max_loss = (w - credit) * spread.multiplier
                 if max_risk_usd is not None and max_loss > max_risk_usd:
@@ -135,12 +174,16 @@ def build_candidates(
                     continue  # cannot exceed the encumbered reserve
                 sort_key = (
                     abs(dte - target_dte),  # prefer nearest target DTE
-                    -float(credit / w),  # then richer credit fraction
+                    -(credit / w),  # Decimal ordering; no floating point tie loss
                     short_c.strike_points,
                     w,
                     expiry.isoformat(),
                 )
-                cid = f"cand:{direction.value}:{expiry}:{short_c.strike_points}:{w}"
+                identity = (
+                    f"{version}|{as_of.isoformat()}|{short_c.contract_id}|{long_c.contract_id}"
+                    f"|{sq['snapshot_at_utc']}|{lq['snapshot_at_utc']}|{credit}"
+                )
+                cid = "cand:" + hashlib.sha256(identity.encode()).hexdigest()[:24]
                 eligible.append(
                     Candidate(
                         cid,

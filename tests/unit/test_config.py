@@ -5,20 +5,13 @@ import yaml
 from pydantic import ValidationError
 
 from spx_research.config import Profile, load_profile
-from spx_research.contracts import SpecNotFoundError, example_config_path
+from spx_research.contracts import example_config_path
 from spx_research.preflight import blocking, check
 
-try:
-    SYNTHETIC_YAML = example_config_path("synthetic")
-    RESEARCH_YAML = example_config_path("research")
-    HAS_SPEC = True
-except SpecNotFoundError:
-    HAS_SPEC = False
-
-needs_spec = pytest.mark.skipif(not HAS_SPEC, reason="spec package not found")
+SYNTHETIC_YAML = example_config_path("synthetic")
+RESEARCH_YAML = example_config_path("research")
 
 
-@needs_spec
 def test_synthetic_profile_parses_and_passes_preflight():
     profile = load_profile(SYNTHETIC_YAML)
     assert profile.mode == "synthetic_test"
@@ -27,7 +20,6 @@ def test_synthetic_profile_parses_and_passes_preflight():
     assert blocking(check(profile)) == []
 
 
-@needs_spec
 def test_research_draft_blocks_on_missing_fields_and_approvals():
     """T49: unapproved research profile must fail preflight, listing gaps."""
     profile = load_profile(RESEARCH_YAML)
@@ -135,3 +127,32 @@ def test_minimal_valid_research_profile_shape():
     assert profile.clock.research_session_open.hour == 9
     assert profile.universe is not None
     assert profile.universe.spread_widths_index_points[0] == 5
+
+
+def test_profile_frozen_json_roundtrips_session_times():
+    from tests.unit.test_baseline_engine import _profile_dict
+
+    profile = Profile.model_validate(_profile_dict())
+    assert Profile.model_validate(profile.model_dump(mode="json")) == profile
+
+
+@pytest.mark.parametrize(
+    "section,field,value",
+    [
+        ("execution", "fill_window", "always"),
+        ("execution", "require_both_legs_same_snapshot", False),
+        ("execution", "opening_fee_per_leg_usd", "-1"),
+        ("execution", "settlement_cash_availability_policy_id", "invented-later"),
+        ("exit_policy", "mandatory_loss_stop_enabled", True),
+        ("exit_policy", "mandatory_exit_before_dte", 2),
+        ("exit_policy", "profit_denominator", "capital"),
+        ("clock", "review_anchor", "fill_time"),
+    ],
+)
+def test_unsupported_execution_and_exit_settings_block(section, field, value):
+    from tests.unit.test_baseline_engine import _profile_dict
+
+    raw = _profile_dict()
+    raw[section][field] = value
+    profile = Profile.model_validate(raw)
+    assert blocking(check(profile))

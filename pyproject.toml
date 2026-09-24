@@ -43,6 +43,7 @@ package = true
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+extend-exclude = ["reference"]  # unchanged governing reference, checked separately
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
@@ -51,6 +52,7 @@ select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
 python_version = "3.12"
 strict = true
 mypy_path = "src"
+exclude = "src/spx_research/resources/migrations/"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

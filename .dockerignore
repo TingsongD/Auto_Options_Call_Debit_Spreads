@@ -1,0 +1,9 @@
+**
+!Dockerfile.isolation
+!src/
+!src/spx_research/
+!src/spx_research/isolation/
+!src/spx_research/isolation/*.py
+!src/spx_research/resources/
+!src/spx_research/resources/contracts/
+!src/spx_research/resources/contracts/**

@@ -75,7 +75,7 @@ def _spread_ctx(with_candidate: bool = True) -> DecisionContext:
     agent = Agent("a1", "SPREAD", Direction.BULL_PUT_CREDIT, AgentState.SEEKING_ENTRY, T0, T0)
     cands = (_cand(),) if with_candidate else ()
     tpls = (LimitTemplate("entry:cand:1", "NATURAL", Decimal("2")),) if with_candidate else ()
-    view = SpreadView(agent, None, None, None, 0, cands, tpls, ())
+    view = SpreadView(agent, None, None, None, 0, cands, tpls, (), equity_usd=Decimal("10000"))
     return DecisionContext("run-1", "main", "a1", "SPREAD", T0, 0, 30, spread_view=view)
 
 
@@ -156,10 +156,10 @@ def test_request_hash_deterministic(tmp_path: Any) -> None:
     deps = _deps(tmp_path)
     run_decision(deps, _spread_ctx())
     req = next(iter(deps.tape._records.values())).request_hash
-    assert req.startswith("req_") and len(req) == 28
+    assert req.startswith("req_") and len(req) == 68
 
 
-def test_retry_on_invalid_response_then_quarantine(tmp_path: Any) -> None:
+def test_epistemic_failure_quarantines_and_pauses_without_retry(tmp_path: Any) -> None:
     class BadThenGood:
         def __init__(self) -> None:
             self.calls = 0
@@ -178,8 +178,9 @@ def test_retry_on_invalid_response_then_quarantine(tmp_path: Any) -> None:
             return self.good.complete(req)
 
     deps = _deps(tmp_path, BadThenGood())
-    proposal, _, _pending = run_decision(deps, _spread_ctx(with_candidate=False))
-    assert proposal.kind == "WAIT"
+    with pytest.raises(PolicyError, match="EPISTEMIC:UNKNOWN_ACTION"):
+        run_decision(deps, _spread_ctx(with_candidate=False))
+    assert deps.gateway.calls == 1
     incidents = deps.ledger.incidents("run-1")
     assert len(incidents) == 1
     assert "UNKNOWN_ACTION" in incidents[0].code
@@ -198,11 +199,11 @@ def test_persistent_failure_raises_policy_error(tmp_path: Any) -> None:
     deps = _deps(tmp_path, AlwaysBad(), max_retries=1)
     with pytest.raises(PolicyError):
         run_decision(deps, _spread_ctx(with_candidate=False))
-    assert len(deps.ledger.incidents("run-1")) == 2  # initial + 1 retry
+    assert len(deps.ledger.incidents("run-1")) == 1  # epistemic failures never retry
 
 
 def test_budget_exceeded_blocks_call(tmp_path: Any) -> None:
-    sheet = PriceSheet("ps-1", "mock-1", Decimal("10"), Decimal("30"))
+    sheet = PriceSheet("ps-1", "mock-1", Decimal("10"), Decimal("30"), model_context_limit=32000)
     budget = Budget(Decimal("0.000001"), sheet)
     deps = _deps(tmp_path, MockGateway(), budget=budget)
     with pytest.raises(PolicyError) as e:
@@ -356,9 +357,7 @@ def test_engine_with_llm_policy_end_to_end(tmp_path: Any) -> None:
         view_metrics = [p["metric"] for p in packet["premises"] if p["metric"] in view_metric_names]
         assert len(view_metrics) == len(set(view_metrics))
         assert all(
-            p["age_minutes"] == 0
-            for p in packet["premises"]
-            if p["metric"] in view_metric_names
+            p["age_minutes"] == 0 for p in packet["premises"] if p["metric"] in view_metric_names
         )
 
 
@@ -441,12 +440,8 @@ def test_request_hash_binds_prompt_and_schema_bytes(tmp_path: Any) -> None:
     """Editing the spec prompt or schema must rotate request identity — an
     old tape must not replay under a different prompt."""
     req_a = ModelRequest("spread_v2", {"x": 1}, "spread_decision", "m")
-    req_b = ModelRequest(
-        "spread_v2", {"x": 1}, "spread_decision", "m", system_prompt_hash="abc"
-    )
-    req_c = ModelRequest(
-        "spread_v2", {"x": 1}, "spread_decision", "m", system_prompt_hash="def"
-    )
+    req_b = ModelRequest("spread_v2", {"x": 1}, "spread_decision", "m", system_prompt_hash="abc")
+    req_c = ModelRequest("spread_v2", {"x": 1}, "spread_decision", "m", system_prompt_hash="def")
     req_d = ModelRequest(
         "spread_v2",
         {"x": 1},
@@ -472,18 +467,14 @@ def test_retry_request_carries_only_error_code(tmp_path: Any) -> None:
         ) -> ModelResponse:
             self.calls.append(req.retry_error_code)
             if len(self.calls) == 1:
-                bad = dict(self.good.complete(req).parsed)
-                bad["action_id"] = "act_forged"
-                return ModelResponse(
-                    req.request_hash(), json.dumps(bad), bad, "mock-1", 0, 0, Decimal(0)
-                )
+                raise ModelError("RATE_LIMIT")
             return self.good.complete(req)
 
     gw = BadThenGood()
     deps = _deps(tmp_path, gw)
     proposal, _, _ = run_decision(deps, _spread_ctx(with_candidate=False))
     assert proposal.kind == "WAIT"
-    assert gw.calls == ["", "UNKNOWN_ACTION"]
+    assert gw.calls == ["", "RATE_LIMIT"]
 
 
 def test_non_dict_response_is_schema_incident_not_crash(tmp_path: Any) -> None:

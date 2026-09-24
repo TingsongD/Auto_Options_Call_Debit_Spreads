@@ -14,6 +14,7 @@ from typing import Any
 
 import duckdb
 
+from spx_research.data.availability import Archive
 from spx_research.domain.types import require_aware
 from spx_research.temporal.calendar import CalendarManifest
 
@@ -49,22 +50,52 @@ def coverage_report(
     missing = sorted(expected - present)
     for d in missing:
         findings.append(CoverageFinding("MISSING_SESSION", d.isoformat()))
-    rows = con.execute(f"SELECT COUNT(*) FROM '{root}/quotes/session=*.parquet'").fetchone()
+    files = sorted((root / "quotes").glob("session=*.parquet"))
+    if not files:
+        con.close()
+        return CoverageReport(str(root), len(expected), 0, tuple(missing), tuple(findings))
+    paths = [str(p) for p in files]
+    rows = con.execute("SELECT COUNT(*) FROM read_parquet(?)", [paths]).fetchone()
     if rows is not None and rows[0] == 0 and present:
         findings.append(CoverageFinding("EMPTY_QUOTES", "all session files empty"))
     bad = con.execute(
-        f"SELECT COUNT(*) FROM '{root}/quotes/session=*.parquet' "
-        "WHERE bid_points > ask_points OR bid_points < 0 OR ask_points < 0"
+        "SELECT COUNT(*) FROM read_parquet(?) "
+        "WHERE bid_points > ask_points OR bid_points < 0 OR ask_points < 0 "
+        "OR bid_size_contracts < 0 OR ask_size_contracts < 0",
+        [paths],
     ).fetchone()
     if bad and bad[0]:
         findings.append(CoverageFinding("INVALID_QUOTES", f"{bad[0]} crossed/negative rows"))
     unknown_age = con.execute(
-        f"SELECT COUNT(*) FROM '{root}/quotes/session=*.parquet' WHERE NOT quote_event_time_known"
+        "SELECT COUNT(*) FROM read_parquet(?) WHERE NOT quote_event_time_known",
+        [paths],
     ).fetchone()
     if unknown_age and unknown_age[0]:
         findings.append(
             CoverageFinding("UNKNOWN_EVENT_AGE", f"{unknown_age[0]} snapshot-only rows")
         )
+    for session in cal.session_days(start, end):
+        path = root / "quotes" / f"session={session.day.isoformat()}.parquet"
+        if not path.is_file():
+            continue
+        observed = {
+            row[0]
+            for row in con.execute(
+                "SELECT DISTINCT snapshot_at_utc FROM read_parquet(?)",
+                [str(path)],
+            ).fetchall()
+        }
+        expected_minutes = {
+            cal.utc_minute(session.day, offset) for offset in session.minute_offsets()
+        }
+        missing_count = len(expected_minutes - observed)
+        if missing_count:
+            findings.append(
+                CoverageFinding(
+                    "MISSING_MINUTES",
+                    f"{session.day.isoformat()}: {missing_count} absent snapshots",
+                )
+            )
     con.close()
     return CoverageReport(
         str(root), len(expected), len(present & expected), tuple(missing), tuple(findings)
@@ -76,18 +107,12 @@ def expected_quote_coverage(
 ) -> dict[str, bool]:
     """Which contracts have a usable quote at as_of (for outage detection)."""
     require_aware(as_of)
-    root = Path(dataset_root)
-    con = duckdb.connect(database=":memory:")
-    out: dict[str, bool] = {}
-    for cid in contract_ids:
-        row = con.execute(
-            f"SELECT COUNT(*) FROM '{root}/quotes/session=*.parquet' "
-            "WHERE contract_id = ? AND simulated_available_at_utc <= ?",
-            [cid, as_of],
-        ).fetchone()
-        out[cid] = bool(row and row[0])
-    con.close()
-    return out
+    archive = Archive(dataset_root)
+    try:
+        quotes = archive.session_quotes(contract_ids, as_of, max_age_seconds=300)
+        return {cid: cid in quotes for cid in contract_ids}
+    finally:
+        archive.close()
 
 
 def summary_dict(report: CoverageReport) -> dict[str, Any]:

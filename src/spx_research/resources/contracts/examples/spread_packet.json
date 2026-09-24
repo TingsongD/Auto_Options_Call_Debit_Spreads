@@ -1,0 +1,65 @@
+{
+  "schema_version": "2.1",
+  "actor_role": "SPREAD",
+  "episode_token": "ep_demo",
+  "decision_token": "dec_demo",
+  "packet_token": "pkt_demo",
+  "prior_belief_token": "bel_demo",
+  "clock": {
+    "session_index": 12,
+    "minute_from_open": 30
+  },
+  "premises": [
+    {
+      "token": "ev_credit",
+      "metric": "profit_fraction",
+      "value": "0.35",
+      "unit": "fraction_of_initial_credit",
+      "kind": "DERIVED",
+      "age_minutes": 0
+    },
+    {
+      "token": "ev_rule",
+      "metric": "advisory_rule",
+      "value": "DISCRETIONARY",
+      "unit": "policy",
+      "kind": "APPROVED_RULE",
+      "age_minutes": 0
+    }
+  ],
+  "assessments": [],
+  "unknowns": [
+    "UNKNOWN_FUTURE_POLICY_PATH",
+    "UNKNOWN_FUTURE_PRICE_PATH"
+  ],
+  "action_menu": [
+    {
+      "action_id": "act_hold",
+      "kind": "HOLD",
+      "target_token": "pos_demo",
+      "limit_option_token": null,
+      "attributes": [],
+      "required_premise_tokens": [
+        "ev_credit",
+        "ev_rule"
+      ]
+    },
+    {
+      "action_id": "act_close",
+      "kind": "CLOSE",
+      "target_token": "pos_demo",
+      "limit_option_token": "limit_close_demo",
+      "attributes": [
+        {
+          "name": "liquidation_fraction",
+          "value": "0.35",
+          "unit": "fraction_of_initial_credit"
+        }
+      ],
+      "required_premise_tokens": [
+        "ev_credit",
+        "ev_rule"
+      ]
+    }
+  ]
+}

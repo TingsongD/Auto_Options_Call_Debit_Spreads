@@ -1,0 +1,32 @@
+{
+  "schema_version": "2.1",
+  "actor_role": "SPREAD",
+  "decision_token": "dec_demo",
+  "packet_token": "pkt_demo",
+  "prior_belief_token": "bel_demo",
+  "action_id": "act_hold",
+  "premise_tokens": [
+    "ev_credit",
+    "ev_rule"
+  ],
+  "assessment_updates": [
+    {
+      "topic": "MANAGEMENT_OUTLOOK",
+      "assessment": "MAINTAIN",
+      "premise_tokens": [
+        "ev_credit",
+        "ev_rule"
+      ],
+      "confidence_label": "LOW"
+    }
+  ],
+  "reason_codes": [
+    "PROFIT_BAND",
+    "MAINTAIN_THESIS"
+  ],
+  "uncertainty_codes": [
+    "UNKNOWN_FUTURE_POLICY_PATH",
+    "UNKNOWN_FUTURE_PRICE_PATH"
+  ],
+  "confidence_label": "LOW"
+}

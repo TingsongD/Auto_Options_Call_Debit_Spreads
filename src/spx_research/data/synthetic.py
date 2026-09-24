@@ -59,7 +59,8 @@ def _toy_premium(right: str, strike: Decimal, spot: Decimal, dte: int, rng_bias:
     else:
         wing = max(Decimal(0), spot * Decimal("1.1") - strike)
     skew = Decimal("0.000075") * wing * wing
-    return max(Decimal("0.05"), (intrinsic + time_value * decay + skew).quantize(Q))
+    premium = intrinsic + time_value * decay + skew
+    return max(Q, (premium / Q).quantize(Decimal(1)) * Q)
 
 
 def _listings(spec: SyntheticSpec, cal: CalendarManifest) -> tuple[dict[str, Any], ...]:
@@ -73,7 +74,12 @@ def _listings(spec: SyntheticSpec, cal: CalendarManifest) -> tuple[dict[str, Any
         for strike in range(lo, hi + int(spec.strike_step), int(spec.strike_step)):
             for right in ("PUT", "CALL"):
                 cid = f"SPXW-{expiry.isoformat()}-{right[0]}{strike}"
-                settle_dt = datetime.combine(expiry, time(20, 0), tzinfo=UTC)
+                expiry_session = cal.session(expiry)
+                settle_dt = (
+                    expiry_session.close_utc()
+                    if expiry_session
+                    else datetime.combine(expiry, time(16, 0), tzinfo=NY).astimezone(UTC)
+                )
                 rows.append(
                     {
                         "contract_id": cid,
@@ -114,6 +120,7 @@ def generate(root: Path, spec: SyntheticSpec, cal: CalendarManifest) -> DataMani
     sessions = cal.session_days(spec.start, spec.end)
     expiry_list = list(spec.expiries)
     greek_rows: list[dict[str, Any]] = []
+    session_closes: dict[date, Decimal] = {}
 
     for sd in sessions:
         idx_rows: list[dict[str, Any]] = []
@@ -143,7 +150,7 @@ def generate(root: Path, spec: SyntheticSpec, cal: CalendarManifest) -> DataMani
                     )
                     # Tight synthetic spread: ~2% of typical OTM premium so that
                     # far-OTM verticals still carry small positive package credit.
-                    half = Decimal("0.02")
+                    half = Q
                     quote_rows.append(
                         {
                             "contract_id": c["contract_id"],
@@ -184,6 +191,7 @@ def generate(root: Path, spec: SyntheticSpec, cal: CalendarManifest) -> DataMani
                                 "quality_flags": ["SYNTHETIC"],
                             }
                         )
+        session_closes[sd.day] = spot
         qpath = ds / "quotes" / f"session={sd.day.isoformat()}.parquet"
         pl.DataFrame(quote_rows).write_parquet(qpath)
         files.append(file_record(ds, qpath, len(quote_rows)))
@@ -202,15 +210,15 @@ def generate(root: Path, spec: SyntheticSpec, cal: CalendarManifest) -> DataMani
         pl.DataFrame(macro_rows).write_parquet(mpath)
         files.append(file_record(ds, mpath, len(macro_rows)))
 
-    # Deterministic settlement value per expiry: last session's close on/before.
+    # The exact expiry session's toy index close; uncovered future expiries
+    # receive no fabricated value or prematurely published settlement row.
     settle_rows = []
     for e in expiry_list:
-        prior = [s for s in sessions if s.day <= e]
-        if not prior:
+        expiry_session = next((s for s in sessions if s.day == e), None)
+        if expiry_session is None:
             continue
-        last = prior[-1]
-        close_ts = last.close_utc()
-        value = spec.spot_start + Decimal(str(rng.gauss(0, 5)))
+        close_ts = expiry_session.close_utc()
+        value = session_closes[e]
         settle_rows.append(
             {
                 "symbol": "SPXW_SETTLE",

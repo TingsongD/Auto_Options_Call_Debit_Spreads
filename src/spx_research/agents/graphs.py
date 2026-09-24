@@ -13,8 +13,10 @@ saver for M4; the durable checkpointer arrives with the Postgres milestone.
 from __future__ import annotations
 
 import hashlib
+import json
 import time
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
+from datetime import datetime
 from decimal import Decimal
 from typing import Any, TypedDict
 
@@ -33,7 +35,12 @@ from spx_research.epistemics.producers import (
     spread_menu,
 )
 from spx_research.epistemics.reducer import reduce_belief
-from spx_research.epistemics.store import AssessmentRecord, Incident, ObservationLedger
+from spx_research.epistemics.store import (
+    AssessmentRecord,
+    Incident,
+    InMemoryObservationLedger,
+    ObservationLedger,
+)
 from spx_research.epistemics.types import (
     Atom,
     Compiled,
@@ -42,9 +49,16 @@ from spx_research.epistemics.types import (
     MenuChoice,
 )
 from spx_research.llm.budget import Budget
-from spx_research.llm.gateway import ModelGateway
+from spx_research.llm.gateway import ModelGateway, RecordedDecisionGateway
 from spx_research.llm.tape import DecisionTape
-from spx_research.llm.types import ModelError, ModelRequest, ModelResponse
+from spx_research.llm.types import (
+    ModelError,
+    ModelRequest,
+    ModelResponse,
+    response_dict,
+    response_from_dict,
+)
+from spx_research.persistence.events import LedgerError
 
 
 @dataclass
@@ -63,6 +77,9 @@ class PolicyDeps:
     private_manifest_id: str = "local"
     system_prompts: dict[str, str] | None = None  # role -> prompt text
     schemas: dict[str, dict[str, Any]] | None = None  # schema_name -> schema
+    runtime: Any = None
+    public_alias_namespace: str | None = None
+    prepared_cache: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 class DecisionRun(TypedDict, total=False):
@@ -78,14 +95,100 @@ class DecisionRun(TypedDict, total=False):
     pending_assessments: list[AssessmentRecord]
     error: str
     attempts: int
+    decision_id: str
+    prepared: dict[str, Any]
+    observations: dict[str, Any]
+    fatal: bool
 
 
 def _schema_name(role: str) -> str:
     return "spread_decision" if role == "SPREAD" else "manager_decision"
 
 
+def _plain(value: Any) -> Any:
+    return json.loads(json.dumps(value, default=str))
+
+
+def logical_decision_id(deps: PolicyDeps, ctx: DecisionContext) -> str:
+    policy = deps.profile.model_dump(mode="json") if deps.profile is not None else {}
+    return "decision_" + digest(
+        [
+            ctx.run_id,
+            ctx.branch_id,
+            ctx.actor_id,
+            ctx.role,
+            ctx.as_of_utc.isoformat(),
+            getattr(ctx, "base_ledger_seq", 0),
+            getattr(ctx, "base_ledger_hash", "genesis"),
+            policy,
+            deps.system_prompts,
+            deps.schemas,
+            deps.model_ids,
+            deps.model_id,
+            deps.public_alias_namespace,
+        ]
+    )
+
+
+def _atom_restore(raw: dict[str, Any]) -> Atom:
+    data = dict(raw)
+    for key in ("published_at", "available_at", "subject_at"):
+        data[key] = datetime.fromisoformat(data[key])
+    data["recipients"] = tuple(data["recipients"])
+    data["dependencies"] = tuple(data["dependencies"])
+    return Atom(**data)
+
+
+def _restore(prepared: dict[str, Any]) -> dict[str, Any]:
+    raw = prepared["compiled"]
+    cr = dict(raw["context"])
+    cr["as_of"] = datetime.fromisoformat(cr["as_of"])
+    context = Context(**cr)
+    menu = {
+        key: MenuChoice(
+            **{
+                **value,
+                "required_atoms": tuple(value["required_atoms"]),
+                "attributes": tuple(tuple(a) for a in value.get("attributes", [])),
+            }
+        )
+        for key, value in raw["action_map"].items()
+    }
+    compiled = Compiled(
+        raw["public"],
+        context,
+        {key: _atom_restore(value) for key, value in raw["premise_map"].items()},
+        menu,
+    )
+    return {
+        "hctx": context,
+        "compiled": compiled,
+        "request": ModelRequest(**prepared["model_request"]),
+        "observations": prepared["observations"],
+        "prepared": prepared,
+    }
+
+
 def _prepare(state: DecisionRun, deps: PolicyDeps) -> DecisionRun:
     ctx = state["ctx"]
+    decision_id = logical_decision_id(deps, ctx)
+    context_hash = digest(_plain(asdict(ctx)))
+    record = deps.runtime.load_decision(ctx.run_id, decision_id) if deps.runtime else None
+    taped = deps.tape.decision(decision_id)
+    saved = (
+        record.request
+        if record is not None
+        else taped.prepared
+        if taped is not None
+        else deps.prepared_cache.get(decision_id)
+    )
+    if saved is not None:
+        if saved["context_hash"] != context_hash:
+            raise PolicyError("DECISION_CONTEXT_MISMATCH")
+        deps.prepared_cache[decision_id] = saved
+        restored = _restore(saved)
+        restored.update({"decision_id": decision_id, "attempts": 0})
+        return restored  # type: ignore[return-value]
     if ctx.role == "SPREAD":
         assert ctx.spread_view is not None
         atoms = spread_atoms(ctx.spread_view, ctx.as_of_utc)
@@ -104,15 +207,30 @@ def _prepare(state: DecisionRun, deps: PolicyDeps) -> DecisionRun:
         ctx.minute_from_open,
         deps.private_manifest_id,
     )
-    # The prior belief is what the actor was entitled to *before* this
-    # barrier's atoms land — reduce before delivering so the packet's
-    # prior_belief_token names the prior state, not the one it creates.
+    if deps.public_alias_namespace is not None:
+        hctx = replace(hctx, alias_namespace=deps.public_alias_namespace)
     prior = reduce_belief(deps.ledger, deps.harness, hctx)
-    for a in atoms:
-        deps.ledger.put_atom(a)
-        deps.ledger.deliver(ctx.run_id, ctx.branch_id, ctx.actor_id, a.atom_id, ctx.as_of_utc)
+    overlay = InMemoryObservationLedger()
+    for atom in deps.ledger.atoms().values():
+        overlay.put_atom(atom)
+    for delivery in deps.ledger.deliveries(ctx.run_id, ctx.branch_id, ctx.actor_id):
+        overlay.deliver(
+            delivery.run_id,
+            delivery.branch_id,
+            delivery.actor_id,
+            delivery.atom_id,
+            delivery.delivered_at,
+        )
+    for assessment in deps.ledger.assessments(ctx.run_id, ctx.branch_id, ctx.actor_id):
+        overlay.put_assessment(assessment)
+    deliveries = []
+    for atom in atoms:
+        overlay.put_atom(atom)
+        deliveries.append(
+            overlay.deliver(ctx.run_id, ctx.branch_id, ctx.actor_id, atom.atom_id, ctx.as_of_utc)
+        )
     compiled = compile_for_actor(
-        deps.ledger,
+        overlay,
         deps.harness,
         hctx,
         menu,
@@ -122,60 +240,211 @@ def _prepare(state: DecisionRun, deps: PolicyDeps) -> DecisionRun:
     schema_name = _schema_name(ctx.role)
     schema = (deps.schemas or {}).get(schema_name)
     system_text = (deps.system_prompts or {}).get(ctx.role.lower(), "")
+    req = ModelRequest(
+        system_prompt_id=f"{ctx.role.lower()}_v2.1",
+        packet=compiled.public,
+        schema_name=schema_name,
+        model_id=(deps.model_ids or {}).get(ctx.role.lower(), deps.model_id),
+        max_output_tokens=deps.max_output_tokens,
+        system_prompt_hash=hashlib.sha256(system_text.encode()).hexdigest(),
+        schema_hash=digest(schema),
+        system_text=system_text,
+        output_schema=schema,
+    )
+    prepared = _plain(
+        {
+            "context_hash": context_hash,
+            "compiled": asdict(compiled),
+            "model_request": asdict(req),
+            "observations": {
+                "atoms": [asdict(a) for a in atoms],
+                "deliveries": [asdict(d) for d in deliveries],
+            },
+        }
+    )
+    if deps.runtime is not None:
+        deps.runtime.prepare_decision(ctx.run_id, decision_id, prepared)
+    deps.prepared_cache[decision_id] = prepared
     return {
         "hctx": hctx,
         "atoms": atoms,
         "menu": menu,
         "compiled": compiled,
-        "request": ModelRequest(
-            system_prompt_id=f"{ctx.role.lower()}_v2",
-            packet=compiled.public,
-            schema_name=schema_name,
-            model_id=deps.model_ids.get(ctx.role.lower(), deps.model_id)
-            if deps.model_ids
-            else deps.model_id,
-            max_output_tokens=deps.max_output_tokens,
-            system_prompt_hash=(
-                hashlib.sha256(system_text.encode()).hexdigest() if system_text else ""
-            ),
-            schema_hash=digest(schema) if schema is not None else "",
-        ),
+        "request": req,
         "attempts": 0,
+        "decision_id": decision_id,
+        "prepared": prepared,
+        "observations": prepared["observations"],
     }
 
 
 def _call_model(state: DecisionRun, deps: PolicyDeps) -> DecisionRun:
+    ctx = state["ctx"]
     req = state["request"]
-    if state.get("error"):
-        # Retry: the request carries only the prior failure's code — never
-        # the rejected prose (quarantined in the incident vault).
-        req = replace(req, retry_error_code=state["error"])
-    rec = deps.tape.lookup(req.request_hash())
-    if rec is not None:
-        return {"response": rec.response, "request": req, "error": ""}
-    reservation = Decimal(0)
-    try:
-        if deps.budget is not None:
-            reservation = deps.budget.reserve(
-                input_tokens=4096, max_output_tokens=req.max_output_tokens
+    decision_id = state["decision_id"]
+    record = deps.runtime.load_decision(ctx.run_id, decision_id) if deps.runtime else None
+    if record is not None and record.status == "ACCEPTED":
+        result = record.result
+        return {
+            "response": response_from_dict(result["response"]),
+            "request": ModelRequest(**result["request"]),
+            "error": "",
+        }
+    taped = deps.tape.decision(decision_id)
+    if taped is not None:
+        request = ModelRequest(**taped.result["request"]) if taped.result else req
+        return {"response": taped.response, "request": request, "error": ""}
+    history = deps.runtime.list_attempts(ctx.run_id, decision_id) if deps.runtime else []
+    if any(
+        attempt.actual_usd is not None and attempt.actual_usd > attempt.reserved_usd
+        for attempt in history
+    ):
+        return {"error": "BUDGET_OVERRUN", "fatal": True}
+    if not state.get("error") and history:
+        last = history[-1]
+        if last.outcome == "DISPATCH_RESERVED" and isinstance(
+            deps.gateway, RecordedDecisionGateway
+        ):
+            # The frozen local source is repeatable and cannot incur a bill.
+            replay_request, replay_response = deps.gateway.replay_decision(req)
+            if last.request != asdict(replay_request) or last.reserved_usd != 0:
+                return {"error": "REPLAY_ATTEMPT_IDENTITY_MISMATCH", "fatal": True}
+            deps.runtime.complete_attempt(
+                ctx.run_id,
+                last.attempt_id,
+                response={
+                    "request": asdict(replay_request),
+                    "model_response": response_dict(replay_response),
+                },
+                actual_usd=Decimal(0),
+                outcome="REPLAYED",
             )
-        schema = (deps.schemas or {}).get(req.schema_name)
-        system_text = (deps.system_prompts or {}).get(ctx_role(state), "")
-        resp = deps.gateway.complete(req, system_text, schema)
-    except ModelError as e:
-        if deps.budget is not None and reservation:
+            return {"request": replay_request, "response": replay_response, "error": ""}
+        if last.outcome in {"DISPATCH_RESERVED", "BILLING_UNCERTAIN"}:
+            if last.outcome == "DISPATCH_RESERVED":
+                deps.runtime.complete_attempt(
+                    ctx.run_id,
+                    last.attempt_id,
+                    response=None,
+                    actual_usd=None,
+                    outcome="BILLING_UNCERTAIN",
+                    error_code="BILLING_UNCERTAIN",
+                )
+            return {"error": "BILLING_UNCERTAIN", "fatal": True}
+        if last.response is not None and last.outcome in {"COMPLETED", "REPLAYED"}:
+            return {
+                "response": response_from_dict(last.response["model_response"]),
+                "request": ModelRequest(**last.response["request"]),
+                "error": "",
+            }
+        if last.response is not None and last.outcome == "RECONCILED":
+            saved_response = response_from_dict(last.response["model_response"])
+            if (saved_response.outcome == "COMPLETED" and not saved_response.error_code) or (
+                saved_response.error_code == "INVALID_USAGE"
+                and (saved_response.provider_metadata or {}).get("output_error_code") == ""
+            ):
+                assert last.actual_usd is not None
+                recovered_response = replace(
+                    saved_response,
+                    cost_usd=last.actual_usd,
+                    billing_uncertain=False,
+                    outcome="COMPLETED",
+                    error_code="",
+                    provider_metadata={
+                        **(saved_response.provider_metadata or {}),
+                        "billing_reconciled_attempt_id": last.attempt_id,
+                        "original_usage_billing_uncertain": saved_response.billing_uncertain,
+                    },
+                )
+                return {
+                    "response": recovered_response,
+                    "request": ModelRequest(**last.response["request"]),
+                    "error": "",
+                }
+        if len(history) > deps.max_retries:
+            return {"error": last.error_code or "RETRY_EXHAUSTED", "fatal": True}
+        req = replace(req, retry_error_code=last.error_code or "PROVIDER_FAILED")
+    elif state.get("error"):
+        req = replace(req, retry_error_code=state["error"])
+    reservation = Decimal(0)
+    attempt_number = len(history) + 1 if deps.runtime else state.get("attempts", 0) + 1
+    attempt_id = f"{decision_id}:{attempt_number}"
+    started = False
+    try:
+        replayed = None
+        if isinstance(deps.gateway, RecordedDecisionGateway):
+            req, replayed = deps.gateway.replay_decision(req)
+        if deps.budget is not None:
+            reservation = deps.budget.price_for(req.model_id).bound(req)
+        if deps.runtime:
+            cap = deps.budget.cap if deps.budget is not None else Decimal(0)
+            deps.runtime.start_attempt(
+                ctx.run_id, decision_id, attempt_id, reservation, cap, request=asdict(req)
+            )
+            started = True
+        elif deps.budget is not None:
+            deps.budget.reserve_amount(reservation)
+        resp = replayed or deps.gateway.complete(req, req.system_text, req.output_schema)
+    except (ModelError, LedgerError) as exc:
+        code = exc.code if isinstance(exc, ModelError) else str(exc)
+        uncertain = isinstance(exc, ModelError) and exc.billing_uncertain
+        if deps.runtime and started:
+            deps.runtime.complete_attempt(
+                ctx.run_id,
+                attempt_id,
+                response=None,
+                actual_usd=None if uncertain else Decimal(0),
+                outcome="FAILED",
+                error_code=code,
+            )
+        elif deps.runtime is None and deps.budget is not None and reservation and not uncertain:
             deps.budget.abort(reservation)
         if deps.retry_backoff_seconds > 0 and state.get("attempts", 0) < deps.max_retries:
-            # Provider-side failures (RATE_LIMIT/TRANSPORT/TIMEOUT) get a
-            # real-time pause before redispatch instead of instantly burning
-            # the remaining attempts.
             time.sleep(deps.retry_backoff_seconds)
-        return {"error": e.code, "attempts": state.get("attempts", 0) + 1}
-    if deps.budget is not None:
-        deps.budget.commit(reservation, Decimal(str(resp.cost_usd)))
-    # Tape only validated responses (see _validate): a rejected response is
-    # quarantined, never replayed, and a retry must re-dispatch the request.
-    return {"response": resp, "request": req, "error": ""}
+        return {
+            "error": "BILLING_UNCERTAIN" if uncertain else code,
+            "attempts": attempt_number,
+            "fatal": uncertain
+            or code
+            in {
+                "BUDGET_EXCEEDED",
+                "PRICE_MODEL_MISMATCH",
+                "INVALID_BUDGET",
+                "ATTEMPT_ALREADY_RESERVED",
+            },
+        }
+    if deps.runtime:
+        deps.runtime.complete_attempt(
+            ctx.run_id,
+            attempt_id,
+            response={"request": asdict(req), "model_response": response_dict(resp)},
+            actual_usd=None if resp.billing_uncertain else resp.cost_usd,
+            outcome=resp.outcome,
+            error_code=resp.error_code,
+        )
+    elif deps.budget is not None and not resp.billing_uncertain:
+        deps.budget.commit(reservation, resp.cost_usd)
+    if resp.billing_uncertain:
+        return {
+            "error": resp.error_code or "BILLING_UNCERTAIN",
+            "fatal": True,
+            "attempts": attempt_number,
+        }
+    if resp.request_hash != req.request_hash() or resp.model_id != req.model_id:
+        return {"error": "EPISTEMIC:MODEL_RESPONSE_IDENTITY_MISMATCH", "fatal": True}
+    overrun = bool(deps.budget and (resp.cost_usd > reservation or deps.budget.overrun))
+    if deps.runtime and deps.budget:
+        totals = deps.runtime.budget_totals(ctx.run_id)
+        overrun = overrun or totals["committed"] + totals["reserved"] > totals["cap"]
+    if overrun:
+        return {"error": "BUDGET_OVERRUN", "fatal": True, "attempts": attempt_number}
+    return {
+        "response": resp,
+        "request": req,
+        "error": resp.error_code,
+        "attempts": attempt_number if resp.error_code else attempt_number - 1,
+        "fatal": resp.billing_uncertain and not resp.error_code,
+    }
 
 
 def ctx_role(state: DecisionRun) -> str:
@@ -189,7 +458,12 @@ def _validate(state: DecisionRun, deps: PolicyDeps) -> DecisionRun:
     parsed = state["response"].parsed
     code = ""
     witness: dict[str, Any] = {}
-    if not isinstance(parsed, dict):
+    if (
+        state["response"].request_hash != state["request"].request_hash()
+        or state["response"].model_id != state["request"].model_id
+    ):
+        code = "MODEL_RESPONSE_IDENTITY_MISMATCH"
+    elif not isinstance(parsed, dict):
         code = "SCHEMA"  # response wasn't even an object — a model fault
     else:
         try:
@@ -211,17 +485,53 @@ def _validate(state: DecisionRun, deps: PolicyDeps) -> DecisionRun:
                 ctx.as_of_utc,
             )
         )
-        return {"error": code, "attempts": state.get("attempts", 0) + 1}
+        return {
+            "error": "EPISTEMIC:" + code,
+            "attempts": state.get("attempts", 0) + 1,
+            "fatal": True,
+        }
     req = state["request"]
+    witness["private_decision_id"] = state["decision_id"]
+    witness["request_hash"] = req.request_hash()
+    result = {
+        "request": asdict(req),
+        "response": response_dict(state["response"]),
+        "witness": witness,
+    }
+    if deps.runtime:
+        attempts = deps.runtime.list_attempts(ctx.run_id, state["decision_id"])
+        deps.runtime.accept_decision(
+            ctx.run_id,
+            state["decision_id"],
+            result=result,
+            attempt_id=attempts[-1].attempt_id if attempts else None,
+        )
     if deps.tape.lookup(req.request_hash()) is None:
-        deps.tape.append(req, state["response"], ctx.as_of_utc.isoformat())
+        deps.tape.append(
+            req,
+            state["response"],
+            ctx.as_of_utc.isoformat(),
+            decision_id=state["decision_id"],
+            prepared=state["prepared"],
+            result=result,
+        )
     return {"witness": witness, "error": ""}
 
 
 def _route(state: DecisionRun, deps: PolicyDeps) -> str:
+    if state.get("fatal"):
+        return END
     if not state.get("error"):
         return "resolve"
-    if state.get("attempts", 0) <= deps.max_retries:
+    if state.get("attempts", 0) <= deps.max_retries and state.get("error") in {
+        "RATE_LIMIT",
+        "TRANSPORT",
+        "TIMEOUT",
+        "INCOMPLETE",
+        "REFUSAL",
+        "SCHEMA",
+        "PROVIDER_FAILED",
+    }:
         return "call_model"
     return END
 
@@ -321,10 +631,13 @@ def run_decision(
     """
     graph = build_decision_graph(deps)
     thread = f"{ctx.run_id}:{ctx.branch_id}:{ctx.actor_id}:{ctx.as_of_utc.isoformat()}"
-    final = graph.invoke(
-        {"ctx": ctx},
-        config={"configurable": {"thread_id": thread}},
-    )
+    try:
+        final = graph.invoke(
+            {"ctx": ctx},
+            config={"configurable": {"thread_id": thread}},
+        )
+    except HarnessError as exc:
+        raise PolicyError("EPISTEMIC:" + str(exc)) from exc
     if final.get("error") or "proposal" not in final:
         raise PolicyError(final.get("error") or "NO_PROPOSAL")
     return (

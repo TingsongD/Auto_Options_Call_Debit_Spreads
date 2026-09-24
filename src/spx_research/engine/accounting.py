@@ -18,11 +18,17 @@ CENTS = Decimal("0.01")
 
 
 def usd(v: Decimal | str | int) -> MoneyUSD:
-    return MoneyUSD(Decimal(v).quantize(CENTS, rounding=ROUND_HALF_UP))
+    value = Decimal(v)
+    if not value.is_finite():
+        raise DomainError("NONFINITE_MONEY")
+    return MoneyUSD(value.quantize(CENTS, rounding=ROUND_HALF_UP))
 
 
 def points(v: Decimal | str | int) -> PricePoints:
-    return PricePoints(Decimal(v))
+    value = Decimal(v)
+    if not value.is_finite():
+        raise DomainError("NONFINITE_PRICE")
+    return PricePoints(value)
 
 
 def gross_max_profit_usd(credit_points: Decimal, multiplier: int) -> MoneyUSD:
@@ -135,12 +141,16 @@ def apply_settlement(
 
 def hold_reservation(snap: AccountSnapshot, reserve_usd: Decimal) -> AccountSnapshot:
     """Pending search/entry reservation encumbers capital before any fill."""
+    if not reserve_usd.is_finite() or reserve_usd <= 0:
+        raise DomainError("NONPOSITIVE_RESERVE")
     if reserve_usd > snap.available():
         raise DomainError("INSUFFICIENT_AVAILABLE_CAPITAL")
     return AccountSnapshot(snap.cash, usd(snap.reserved + reserve_usd), snap.fees_paid)
 
 
 def release_reservation(snap: AccountSnapshot, reserve_usd: Decimal) -> AccountSnapshot:
+    if not reserve_usd.is_finite() or reserve_usd <= 0:
+        raise DomainError("NONPOSITIVE_RESERVE")
     if reserve_usd > snap.reserved:
         raise DomainError("RESERVE_RELEASE_EXCEEDS_RESERVED")
     return AccountSnapshot(snap.cash, usd(snap.reserved - reserve_usd), snap.fees_paid)

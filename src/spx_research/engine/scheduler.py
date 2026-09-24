@@ -1,35 +1,48 @@
 """Deterministic minute scheduler (M3-03) — the §6.2 ordered loop.
 
-At each simulated minute ``t``: settle due positions → resolve eligible orders
-→ session-close expirations → manager review if triggered → spread reviews at
-their grid times → commit. New agents first act at their *next* regular grid
-review; no same-minute lifecycle recursion; no same-minute fills (T06); pending
-exits keep capital encumbered (D14).
+At each simulated minute: resolve prior exits/entries, settle due positions,
+record valuations, then atomically commit all decisions from one frozen view.
+A durable phase cursor resumes interrupted work without duplicating effects.
+New agents first act at their next regular grid review; pending exits retain
+their capital. Data or model failures halt the clock at the failed phase.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from copy import deepcopy
+from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
-from typing import Any
+from typing import Any, cast
 
 from spx_research.config import Profile
 from spx_research.data.availability import Archive
+from spx_research.data.validation import on_increment, quote_from_row, validate_pair
+from spx_research.domain.results import (
+    PauseCategory,
+    PauseReason,
+    RunStatus,
+    ValuationQuality,
+    ValuationRecord,
+)
 from spx_research.domain.state import (
     AgentState,
     Event,
     Order,
     OrderIntent,
     OrderStatus,
+    Position,
     PositionStatus,
     ReservationStatus,
+    event_hash,
 )
 from spx_research.domain.types import Direction, DomainError, Quote
 from spx_research.engine.accounting import estimated_liquidation_pnl_usd, usd
 from spx_research.engine.execution import FillStatus, Intent, PackageOrder, try_fill
-from spx_research.engine.ledger import EngineState, fold, spread_payload
+from spx_research.engine.ledger import EngineState, fold, replay, spread_payload
 from spx_research.engine.policy import (
     DecisionContext,
     LimitTemplate,
@@ -42,9 +55,9 @@ from spx_research.engine.policy import (
     validate_manager_proposal,
     validate_spread_proposal,
 )
-from spx_research.engine.settlement import expiration_liability_points
+from spx_research.engine.settlement import expiration_liability_points, require_settlement_value
 from spx_research.features.candidates import Candidate, build_candidates
-from spx_research.persistence.events import EventStore
+from spx_research.persistence.events import EventStore, payload_hash
 from spx_research.temporal.calendar import NY, UTC_TZ, CalendarManifest, SessionDay
 
 
@@ -54,20 +67,24 @@ class RunResult:
     events: list[Event]
     final_state: EngineState
     decisions: list[dict[str, Any]] = field(default_factory=list)
+    status: RunStatus = "COMPLETED"
+    pause: PauseReason | None = None
+    valuations: list[ValuationRecord] = field(default_factory=list)
+    scored_end_valuation: ValuationRecord | None = None
+    runoff_summary: dict[str, Any] = field(default_factory=dict)
+    research_validity: str = "UNVALIDATED"
 
 
 def _quote_from_row(row: dict[str, Any]) -> Quote:
-    return Quote(
-        contract_id=row["contract_id"],
-        snapshot_at_utc=row["snapshot_at_utc"],
-        bid_points=Decimal(str(row["bid_points"])),
-        ask_points=Decimal(str(row["ask_points"])),
-        bid_size_contracts=int(row["bid_size_contracts"]),
-        ask_size_contracts=int(row["ask_size_contracts"]),
-        simulated_available_at_utc=row["simulated_available_at_utc"],
-        quote_event_time_known=bool(row.get("quote_event_time_known", False)),
-        quality_flags=tuple(row.get("quality_flags") or ()),
-    )
+    return quote_from_row(row)
+
+
+class DataPause(ValueError):
+    """Required data is unavailable; the clock must remain at this phase."""
+
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(code)
 
 
 class Engine:
@@ -107,7 +124,19 @@ class Engine:
         self._id_counter = 0
         self._manager_due = False
         self.decisions: list[dict[str, Any]] = []
-        self._gap_reported: set[tuple[str, date]] = set()
+        self.status: RunStatus = "RUNNING"
+        self.pause: PauseReason | None = None
+        self._buffer: list[Event] | None = None
+        self._cursor: dict[str, Any] = {}
+        self._current_valuation: ValuationRecord | None = None
+        self._quote_cache: dict[tuple[str, datetime], dict[str, Any] | None] = {}
+        self._candidate_cache: dict[tuple[Any, ...], tuple[Candidate, ...]] = {}
+        self._candidate_findings: list[dict[str, Any]] = []
+        self._barrier_id = ""
+        self._base_tip = (0, "genesis")
+        self._run_sessions: list[SessionDay] = []
+        self._run_end: date | None = None
+        self._scored_session_day: date | None = None
 
     # -- ids & events -----------------------------------------------------
 
@@ -116,6 +145,11 @@ class Engine:
         return f"{prefix}-{self._id_counter:05d}"
 
     def _emit(self, t: datetime, phase: str, type_: str, payload: dict[str, Any]) -> None:
+        if self._buffer is not None:
+            event = Event(self.run_id, self.state.seq + 1, t, phase, type_, payload)
+            self._buffer.append(event)
+            fold(self.state, event)
+            return
         committed = self.store.append(
             Event(self.run_id, self.state.seq + 1, t, phase, type_, payload),
             expected_seq=self.state.seq,
@@ -134,133 +168,643 @@ class Engine:
 
     # -- public run loop --------------------------------------------------
 
-    def run(self, start: date, end: date) -> RunResult:
-        p = self.profile
-        first = self.calendar.session_days(start, end)
-        boot = (
-            first[0].open_utc()
-            if first
-            else datetime.combine(start, datetime.min.time(), tzinfo=UTC_TZ)
+    def _runtime_cursor(self, **updates: Any) -> dict[str, Any]:
+        cursor = dict(self._cursor)
+        cursor.update(updates)
+        cursor.update(id_counter=self._id_counter, manager_due=self._manager_due)
+        return cursor
+
+    def _state_hash(self) -> str:
+        blob = json.dumps(asdict(self.state), sort_keys=True, default=str, separators=(",", ":"))
+        return hashlib.sha256(blob.encode()).hexdigest()
+
+    def _persist_pause(self, t: datetime, phase: str, category: PauseCategory, code: str) -> None:
+        self.status = "PAUSED"
+        self.pause = {"category": category, "code": code, "phase": phase, "at": t.isoformat()}
+        if category == "DATA" and code != "RUNOFF_INCOMPLETE":
+            self.pause["valuation"] = {
+                "as_of": t.isoformat(),
+                "cash_usd": str(self.state.account.cash),
+                "reserved_usd": str(self.state.account.reserved),
+                "fees_paid_usd": str(self.state.account.fees_paid),
+                "mid_equity_usd": None,
+                "net_liquidation_equity_usd": None,
+                "quality": "UNPRICEABLE",
+                "reason_code": code,
+                "positions": [
+                    {
+                        "position_id": p.position_id,
+                        "quality": "UNPRICEABLE",
+                        "reason_code": code,
+                        "mid_liability_usd": None,
+                        "liquidation_liability_usd": None,
+                    }
+                    for p in self.state.open_positions()
+                ],
+            }
+        self._cursor = self._runtime_cursor(simulated_at=t.isoformat(), next_phase=phase)
+        persist = getattr(self.store, "persist_cursor", None)
+        if callable(persist):
+            persist(self.run_id, self._cursor, "PAUSED", self.pause)
+
+    def _atomic(
+        self,
+        t: datetime,
+        phase: str,
+        work: Callable[[], None],
+        next_cursor: dict[str, Any],
+        *,
+        assessments: list[Any] | None = None,
+        observations: dict[str, Any] | None = None,
+    ) -> None:
+        """Stage domain effects and atomically commit them with their recovery cursor."""
+        base_state = self.state
+        base_counter, base_due = self._id_counter, self._manager_due
+        base_valuation = self._current_valuation
+        # Every aggregate member is immutable; only the projection dictionaries
+        # need copying. Deep-copying years of retired agents at every minute
+        # would turn an otherwise linear simulation into quadratic work.
+        self.state = replace(
+            base_state,
+            agents=dict(base_state.agents),
+            positions=dict(base_state.positions),
+            orders=dict(base_state.orders),
+            reservations=dict(base_state.reservations),
         )
-        assert p.portfolio is not None
-        self._emit(
-            boot,
-            "RUN",
-            "RUN_STARTED",
+        self._buffer = []
+        try:
+            work()
+            events = self._buffer
+            cursor = self._runtime_cursor(**next_cursor)
+            linked_hash = self.store.tip(self.run_id)[1]
+            for event in events:
+                linked_hash = event.with_hashes(payload_hash(event.payload), linked_hash).event_hash
+            barrier_id = f"{self.branch_id}:{t.isoformat()}:{phase}"
+            commit = getattr(self.store, "commit_barrier", None)
+            cursor.update(ledger_seq=self.state.seq, ledger_hash=linked_hash)
+            if callable(commit):
+                cursor["state_hash"] = self._state_hash()
+            if callable(commit):
+                commit(
+                    self.run_id,
+                    barrier_id,
+                    base_state.seq,
+                    events,
+                    cursor,
+                    assessments=assessments or [],
+                    observations=observations,
+                )
+            else:
+                append_batch = getattr(self.store, "append_batch", None)
+                if not callable(append_batch):
+                    raise DomainError("ATOMIC_EVENT_STORE_REQUIRED")
+                append_batch(events, expected_seq=base_state.seq)
+            self._cursor = cursor
+        except BaseException:
+            self.state = base_state
+            self._id_counter, self._manager_due = base_counter, base_due
+            self._current_valuation = base_valuation
+            raise
+        finally:
+            self._buffer = None
+
+    def _result(self) -> RunResult:
+        events = self.store.events(self.run_id)
+        valuations = [
+            cast(ValuationRecord, e.payload) for e in events if e.type == "VALUATION_RECORDED"
+        ]
+        if self.pause and self.pause.get("valuation"):
+            valuations.append(self.pause["valuation"])
+        scored = [
+            cast(ValuationRecord, e.payload) for e in events if e.type == "SCORED_END_VALUATION"
+        ]
+        decisions = [
             {
-                "profile_id": p.profile_id,
-                "mode": p.mode,
-                "initial_cash_usd": str(p.portfolio.initial_capital_usd),
+                "actor": e.payload["actor_id"],
+                "at": e.sim_time_utc.isoformat(),
+                "proposal": e.payload.get("kind", "REJECTED"),
+                **({"rejected": e.payload["code"]} if e.type == "DECISION_REJECTED" else {}),
+            }
+            for e in events
+            if e.type in ("DECISION_MADE", "DECISION_REJECTED")
+        ]
+        return RunResult(
+            self.run_id,
+            events,
+            self.state,
+            decisions,
+            self.status,
+            self.pause,
+            valuations,
+            scored[-1] if scored else None,
+            {
+                "included": bool(
+                    self.profile.study
+                    and self.profile.study.runoff_end_date
+                    and self.profile.study.scored_end_date
+                    and self.profile.study.runoff_end_date > self.profile.study.scored_end_date
+                ),
+                "open_positions": len(self.state.open_positions()),
+                "complete": self.status == "COMPLETED" and not self.state.open_positions(),
             },
         )
-        last_t = boot
-        for session_index, sess in enumerate(self.calendar.session_days(start, end)):
-            last_t = self._session(sess, session_index)
-        self._emit(last_t, "RUN", "RUN_ENDED", {})
-        return RunResult(self.run_id, self.store.events(self.run_id), self.state, self.decisions)
 
-    def _session(self, sess: SessionDay, session_index: int) -> datetime:
-        p = self.profile
-        assert p.clock is not None
-        self._gap_reported.clear()  # settlement gaps report once per position per day
-        grid = set(self.calendar.review_times(sess.day, p.clock.agent_review_minutes))
+    def run(self, start: date, end: date) -> RunResult:
+        """Start or resume the same run at its last atomically committed phase."""
+        assert self.profile.portfolio is not None
+        assert self.profile.portfolio.initial_capital_usd is not None
+        initial_cash = self.profile.portfolio.initial_capital_usd
+        sessions = self.calendar.session_days(start, end)
+        self._run_sessions, self._run_end = sessions, end
+        cutoff = self.profile.study.scored_end_date if self.profile.study else None
+        self._scored_session_day = max(
+            (s.day for s in sessions if cutoff is not None and s.day <= cutoff),
+            default=None,
+        )
+        boot = (
+            sessions[0].open_utc() if sessions else datetime.combine(start, time.min, tzinfo=UTC_TZ)
+        )
+        runtime_load = getattr(self.store, "load_run", None)
+        record = runtime_load(self.run_id) if callable(runtime_load) else None
+        if record is None:
+            begin = getattr(self.store, "begin_run", None)
+            if callable(begin):
+                begin(
+                    self.run_id,
+                    {
+                        "format_version": 2,
+                        "engine_version": "2.1",
+                        "profile": self.profile.model_dump(mode="json"),
+                        "calendar_id": self.calendar.calendar_id,
+                        "data_manifest": getattr(self.archive, "manifest", {}),
+                        "start": start.isoformat(),
+                        "end": end.isoformat(),
+                    },
+                )
+        existing = self.store.events(self.run_id)
+        if existing:
+            if record is None or not record.cursor:
+                raise DomainError("RESUME_CURSOR_REQUIRED")
+            previous_hash = "genesis"
+            for index, event in enumerate(existing, 1):
+                if (
+                    event.run_id != self.run_id
+                    or event.seq != index
+                    or event.previous_hash != previous_hash
+                    or event.payload_hash != payload_hash(event.payload)
+                    or event.event_hash != event_hash(event)
+                ):
+                    raise DomainError("RESUME_EVENT_CHAIN_MISMATCH")
+                previous_hash = event.event_hash
+            self.state = replay(self.run_id, initial_cash, existing)
+            self._cursor = dict(record.cursor)
+            self._id_counter = int(self._cursor.get("id_counter", 0))
+            self._manager_due = bool(self._cursor.get("manager_due", False))
+            if (self._cursor.get("ledger_seq"), self._cursor.get("ledger_hash")) != self.store.tip(
+                self.run_id
+            ) or self._cursor.get("state_hash") != self._state_hash():
+                raise DomainError("RESUME_CURSOR_LINEAGE_MISMATCH")
+            previous = [
+                cast(ValuationRecord, e.payload) for e in existing if e.type == "VALUATION_RECORDED"
+            ]
+            self._current_valuation = previous[-1] if previous else None
+            if record.status == "COMPLETED" or self._cursor.get("next_phase") == "COMPLETE":
+                self.status = "COMPLETED"
+                return self._result()
+            if record.pause and record.pause.get("category") == "EPISTEMIC":
+                self.status, self.pause = "PAUSED", cast(PauseReason, dict(record.pause))
+                return self._result()
+            if record.pause and record.pause.get("code") in {
+                "BILLING_UNCERTAIN",
+                "INVALID_USAGE",
+                "BUDGET_OVERRUN",
+                "BUDGET_EXCEEDED",
+            }:
+                self.status, self.pause = "PAUSED", cast(PauseReason, dict(record.pause))
+                return self._result()
+        else:
+            self._cursor = {"session_index": 0, "minute_offset": 0, "next_phase": "MARKET"}
+            self._atomic(
+                boot,
+                "START",
+                lambda: self._emit(
+                    boot,
+                    "RUN",
+                    "RUN_STARTED",
+                    {
+                        "profile_id": self.profile.profile_id,
+                        "mode": self.profile.mode,
+                        "initial_cash_usd": str(initial_cash),
+                    },
+                ),
+                self._cursor,
+            )
+        self.status, self.pause = "RUNNING", None
+        for session_index, sess in enumerate(sessions):
+            if session_index < int(self._cursor.get("session_index", 0)):
+                continue
+            self._session(sess, session_index)
+            if self._is_paused():
+                return self._result()
+        last_t = self.store.events(self.run_id)[-1].sim_time_utc if existing or sessions else boot
+        if self.state.open_positions():
+            self._persist_pause(last_t, "FINAL", "DATA", "RUNOFF_INCOMPLETE")
+            return self._result()
+        self._atomic(
+            last_t,
+            "END",
+            lambda: self._emit(
+                last_t,
+                "RUN",
+                "RUN_ENDED",
+                {
+                    "research_validity": "UNVALIDATED",
+                },
+            ),
+            {"next_phase": "COMPLETE", "simulated_at": last_t.isoformat()},
+        )
+        self.status = "COMPLETED"
+        persist = getattr(self.store, "persist_cursor", None)
+        if callable(persist):
+            persist(self.run_id, self._cursor, "COMPLETED", None)
+        return self._result()
+
+    def _session(self, sess: SessionDay, session_index: int) -> None:
+        assert self.profile.clock is not None
+        grid = set(self.calendar.review_times(sess.day, self.profile.clock.agent_review_minutes))
         first_review = min(grid) if grid else None
-        last_offset = sess.minute_offsets()[-1]
-        last_t = self.calendar.utc_minute(sess.day, last_offset)
+        start_offset = int(self._cursor.get("minute_offset", 0))
+        self._quote_cache.clear()
+        self._candidate_cache.clear()
         for offset in sess.minute_offsets():
+            if offset < start_offset:
+                continue
             t = self.calendar.utc_minute(sess.day, offset)
-            if t == first_review:
-                self._manager_due = True  # first daily manager review
-            self._settle_due(sess.day, t)
-            self._resolve_orders(t)
-            if offset == last_offset:
-                self._session_close(sess, t)
-            elif self._manager_due:
-                self._manager_review(t, sess, offset, session_index)
-                self._manager_due = False
-            if t in grid:
-                self._spread_reviews(sess, t, offset, session_index)
-        # PM-settled positions: values publish after the close (synthetic:
-        # close+30m). One post-close pass books same-day settlement; if the
-        # value is still absent the per-minute check retries next session.
-        self._settle_due(sess.day, sess.close_utc() + timedelta(minutes=60))
-        return last_t
+            phase = self._cursor.get("next_phase", "MARKET")
+            self._quote_cache.clear()
+            self._candidate_cache.clear()
+            self._candidate_findings.clear()
+            if phase == "MARKET":
 
-    # -- phases ------------------------------------------------------------
+                def market(at: datetime = t) -> None:
+                    self._resolve_orders(at)
+                    self._settle_due(sess.day, at)
+                    self._record_valuation(at)
+                    if at == first_review:
+                        self._manager_due = True
 
-    def _settle_due(self, day: date, t: datetime) -> None:
-        """Settle positions whose expiry has passed and whose PM value is now
-        available. Runs per-minute during the session, once post-close on the
-        expiry day itself, and keeps retrying on later sessions so a
-        late-published value still settles (T36)."""
-        assert self.profile.execution is not None
-        for pos in sorted(self.state.open_positions(), key=lambda p: p.position_id):
-            expiry = pos.spread.expiration_local_date
-            if expiry > day:
-                continue  # not yet expiring
-            st = self.archive.settlement_for(expiry)
-            if (
-                st is None
-                or st["simulated_available_at_utc"] > t
-                or st.get("value_index_points") is None
-            ):
-                gap_key = (pos.position_id, day)
-                if expiry == day and gap_key not in self._gap_reported:
-                    # Report the gap once per position per expiry day; the
-                    # per-minute retries and later-session retries stay quiet.
-                    self._gap_reported.add(gap_key)
-                    self._emit(
+                try:
+                    self._atomic(
                         t,
-                        "SETTLEMENT",
-                        "DATA_GAP",
+                        "MARKET",
+                        market,
                         {
-                            "position_id": pos.position_id,
-                            "kind": "settlement_unavailable",
+                            "session_index": session_index,
+                            "minute_offset": offset,
+                            "next_phase": "DECISION",
+                            "simulated_at": t.isoformat(),
                         },
                     )
+                except DataPause as exc:
+                    self._persist_pause(t, "MARKET", "DATA", exc.code)
+                    return
+            if self._cursor.get("next_phase") == "DECISION":
+                try:
+                    self._decision_barrier(sess, t, offset, session_index, t in grid)
+                except DataPause as exc:
+                    self._persist_pause(t, "DECISION", "DATA", exc.code)
+                    return
+                except PolicyError as exc:
+                    category: PauseCategory = (
+                        "BUDGET"
+                        if "BUDGET" in exc.code
+                        or exc.code in {"BILLING_UNCERTAIN", "INVALID_USAGE"}
+                        else (
+                            "EPISTEMIC"
+                            if any(
+                                s in exc.code
+                                for s in (
+                                    "EVIDENCE",
+                                    "EGRESS",
+                                    "SCOPE",
+                                    "DEPENDENCY",
+                                    "ASSESSMENT",
+                                    "EPISTEMIC",
+                                )
+                            )
+                            else "MODEL"
+                        )
+                    )
+                    self._persist_pause(t, "DECISION", category, exc.code)
+                    return
+        close_t = sess.close_utc()
+        if self._cursor.get("next_phase") != "SETTLEMENT":
+            try:
+
+                def close() -> None:
+                    self._session_close(sess, close_t)
+                    self._settle_due(sess.day, close_t)
+                    self._record_valuation(close_t)
+                    if self._scored_session_day == sess.day:
+                        self._emit(
+                            close_t,
+                            "VALUATION",
+                            "SCORED_END_VALUATION",
+                            dict(self._current_valuation or {}),
+                        )
+
+                self._atomic(
+                    close_t,
+                    "CLOSE",
+                    close,
+                    {
+                        "session_index": session_index,
+                        "minute_offset": len(sess.minute_offsets()),
+                        "next_phase": "SETTLEMENT",
+                        "simulated_at": close_t.isoformat(),
+                    },
+                )
+            except DataPause as exc:
+                self._persist_pause(close_t, "CLOSE", "DATA", exc.code)
+                return
+        # Private archive availability drives settlement events, never a model-visible schedule.
+        times: set[datetime] = set()
+        next_open = (
+            self._run_sessions[session_index + 1].open_utc()
+            if session_index + 1 < len(self._run_sessions)
+            else datetime.combine(
+                (self._run_end or sess.day) + timedelta(days=1), time.min, tzinfo=NY
+            ).astimezone(UTC_TZ)
+        )
+        for pos in self.state.open_positions():
+            if pos.spread.expiration_local_date > sess.day:
                 continue
-            settle_value = Decimal(str(st["value_index_points"]))
-            liability = expiration_liability_points(pos.spread, settle_value)
-            fee = self.profile.execution.closing_fee_per_leg_usd
+            row = self.archive.settlement_for(pos.spread.expiration_local_date)
+            if row and row.get("simulated_available_at_utc") is not None:
+                available = row["simulated_available_at_utc"]
+                if close_t < available < next_open:
+                    times.add(available)
+        for t in sorted(times):
+            if t.isoformat() <= str(self._cursor.get("settlement_processed_through", "")):
+                continue
+            try:
+
+                def settle(at: datetime = t) -> None:
+                    self._settle_due(sess.day, at)
+                    self._record_valuation(at, allow_unknown=True)
+
+                self._atomic(
+                    t,
+                    "SETTLEMENT",
+                    settle,
+                    {
+                        "next_phase": "SETTLEMENT",
+                        "settlement_processed_through": t.isoformat(),
+                        "simulated_at": t.isoformat(),
+                    },
+                )
+            except DataPause as exc:
+                self._persist_pause(t, "SETTLEMENT", "DATA", exc.code)
+                return
+        cursor = self._runtime_cursor(
+            session_index=session_index + 1,
+            minute_offset=0,
+            next_phase="MARKET",
+        )
+        self._cursor = cursor
+        persist = getattr(self.store, "persist_cursor", None)
+        if callable(persist):
+            persist(self.run_id, cursor, "RUNNING", None)
+
+    def _is_paused(self) -> bool:
+        return self.status == "PAUSED"
+
+    def _last_trading_time(self, pos: Position) -> datetime:
+        known = pos.spread.short.last_trading_at_utc
+        if known is not None:
+            return known
+        session = self.calendar.session(pos.spread.expiration_local_date)
+        if session is None:
+            raise DataPause("MISSING_EXPIRY_SESSION")
+        return session.close_utc()
+
+    def _settle_due(self, day: date, t: datetime) -> None:
+        assert self.profile.execution is not None
+        for pos in sorted(self.state.open_positions(), key=lambda p: p.position_id):
+            if pos.spread.expiration_local_date > day or t < self._last_trading_time(pos):
+                continue
+            row = self.archive.settlement_for(pos.spread.expiration_local_date)
+            if row is None or row.get("value_index_points") is None:
+                raise DataPause("MISSING_SETTLEMENT_VALUE")
+            available = row.get("simulated_available_at_utc")
+            published, settled = row.get("published_at_utc"), row.get("settled_at_utc")
+            if available is None or published is None or settled is None:
+                raise DataPause("UNVERIFIED_SETTLEMENT_TIME")
+            if available < max(published, settled) or settled < self._last_trading_time(pos):
+                raise DataPause("INVALID_SETTLEMENT_TIME")
+            if available > t:
+                continue
+            value = require_settlement_value(Decimal(str(row["value_index_points"])))
+            fee = getattr(self.profile.execution, "settlement_fee_per_leg_usd", None)
+            if fee is None:
+                if self.profile.mode != "synthetic_test":
+                    raise DataPause("MISSING_SETTLEMENT_FEE")
+                fee = self.profile.execution.closing_fee_per_leg_usd
             assert fee is not None
-            fees = usd(fee * 2)
             self._emit(
                 t,
                 "SETTLEMENT",
                 "POSITION_SETTLED",
                 {
                     "position_id": pos.position_id,
-                    "settlement_value_points": str(settle_value),
-                    "liability_points": str(liability),
-                    "fees_usd": str(fees),
+                    "settlement_value_points": str(value),
+                    "liability_points": str(expiration_liability_points(pos.spread, value)),
+                    "fees_usd": str(usd(fee * 2)),
                     "final_status": "SETTLED",
+                    "published_at_utc": published.isoformat(),
+                    "settled_at_utc": settled.isoformat(),
+                    "cash_availability_policy": "immediate_on_verified_publication",
+                    "fee_assumption": (
+                        "synthetic_closing_fee"
+                        if getattr(self.profile.execution, "settlement_fee_per_leg_usd", None)
+                        is None
+                        else "explicit_settlement_fee"
+                    ),
                 },
             )
             self._retire_agent(pos.agent_id, t, "SETTLED")
             self._manager_due = True
 
+    def _quote_row(self, contract_id: str, t: datetime) -> dict[str, Any] | None:
+        key = (contract_id, t)
+        if key not in self._quote_cache:
+            age = self.profile.quality.max_quote_age_seconds if self.profile.quality else 300
+            ids = {contract_id}
+            for position in self.state.open_positions():
+                ids.update((position.spread.short.contract_id, position.spread.long.contract_id))
+            for order in self.state.orders.values():
+                if order.status is OrderStatus.PENDING:
+                    ids.update((order.spread.short.contract_id, order.spread.long.contract_id))
+            rows = self.archive.session_quotes(sorted(ids), t, max_age_seconds=age)
+            self._quote_cache.update({(cid, t): rows.get(cid) for cid in ids})
+        return self._quote_cache[key]
+
+    def _pair(self, spread: Any, t: datetime) -> tuple[Quote, Quote]:
+        rows = [self._quote_row(c.contract_id, t) for c in (spread.short, spread.long)]
+        if any(row is None for row in rows):
+            raise DataPause("REQUIRED_QUOTE_MISSING")
+        try:
+            short, long = (_quote_from_row(row) for row in rows if row is not None)
+            if (short.contract_id, long.contract_id) != (
+                spread.short.contract_id,
+                spread.long.contract_id,
+            ):
+                raise DomainError("QUOTE_CONTRACT_MISMATCH")
+            validate_pair(
+                short,
+                long,
+                t,
+                max_snapshot_age_seconds=(
+                    self.profile.quality.max_quote_age_seconds if self.profile.quality else 300
+                ),
+                max_event_age_seconds=(
+                    self.profile.execution.max_known_quote_age_seconds
+                    if self.profile.execution
+                    else 60
+                ),
+            )
+        except (ValueError, TypeError, ArithmeticError) as exc:
+            code = str(exc) if isinstance(exc, DomainError) else "INVALID_QUOTE_VALUE"
+            raise DataPause(f"INVALID_REQUIRED_QUOTE:{code}") from exc
+        return short, long
+
+    def _record_valuation(self, t: datetime, *, allow_unknown: bool = False) -> None:
+        assert self.profile.execution is not None
+        fee = self.profile.execution.closing_fee_per_leg_usd or Decimal(0)
+        positions: list[dict[str, Any]] = []
+        mid_total = liquidation_total = fees_total = Decimal(0)
+        unknown = False
+        quality: ValuationQuality = "OK"
+        for pos in sorted(self.state.open_positions(), key=lambda p: p.position_id):
+            if t >= self._last_trading_time(pos):
+                unknown = True
+                if quality != "UNPRICEABLE":
+                    quality = "PENDING_SETTLEMENT"
+                positions.append(
+                    {
+                        "position_id": pos.position_id,
+                        "quality": "PENDING_SETTLEMENT",
+                        "mid_liability_usd": None,
+                        "liquidation_liability_usd": None,
+                    }
+                )
+                continue
+            try:
+                short, long = self._pair(pos.spread, t)
+                if short.ask_size_contracts < 1 or long.bid_size_contracts < 1:
+                    raise DataPause("POSITION_LIQUIDATION_SIZE_INADEQUATE")
+            except DataPause as exc:
+                if not allow_unknown:
+                    raise
+                unknown = True
+                quality = "UNPRICEABLE"
+                positions.append(
+                    {
+                        "position_id": pos.position_id,
+                        "quality": "UNPRICEABLE",
+                        "reason_code": exc.code,
+                        "mid_liability_usd": None,
+                        "liquidation_liability_usd": None,
+                    }
+                )
+                continue
+            mid = (
+                ((short.bid_points + short.ask_points) - (long.bid_points + long.ask_points))
+                / 2
+                * pos.spread.multiplier
+            )
+            liquid = (short.ask_points - long.bid_points) * pos.spread.multiplier
+            closing_fees = usd(fee * 2)
+            mid_total += mid
+            liquidation_total += liquid
+            fees_total += closing_fees
+            positions.append(
+                {
+                    "position_id": pos.position_id,
+                    "mid_liability_usd": str(usd(mid)),
+                    "liquidation_liability_usd": str(usd(liquid)),
+                    "estimated_closing_fees_usd": str(closing_fees),
+                    **(
+                        {"anomalies": ["LIQUIDATION_ABOVE_WIDTH"]}
+                        if liquid > pos.spread.width_points * pos.spread.multiplier
+                        else {}
+                    ),
+                    "quality": "OK"
+                    if short.quote_event_time_known and long.quote_event_time_known
+                    else "UNKNOWN_EVENT_AGE",
+                    "source_refs": [
+                        {
+                            "contract_id": q.contract_id,
+                            "snapshot_at": q.snapshot_at_utc.isoformat(),
+                            "available_at": q.simulated_available_at_utc.isoformat(),
+                            "bid_points": str(q.bid_points),
+                            "ask_points": str(q.ask_points),
+                        }
+                        for q in (short, long)
+                    ],
+                }
+            )
+        self._current_valuation = {
+            "as_of": t.isoformat(),
+            "cash_usd": str(self.state.account.cash),
+            "reserved_usd": str(self.state.account.reserved),
+            "available_capital_usd": str(self.state.account.available()),
+            "fees_paid_usd": str(self.state.account.fees_paid),
+            "mid_liability_usd": None if unknown else str(usd(mid_total)),
+            "liquidation_liability_usd": None if unknown else str(usd(liquidation_total)),
+            "estimated_closing_fees_usd": str(usd(fees_total)),
+            "mid_equity_usd": None if unknown else str(usd(self.state.account.cash - mid_total)),
+            "net_liquidation_equity_usd": None
+            if unknown
+            else str(usd(self.state.account.cash - liquidation_total - fees_total)),
+            "quality": quality,
+            "positions": positions,
+        }
+        self._emit(t, "VALUATION", "VALUATION_RECORDED", dict(self._current_valuation))
+
+    def _equity(self) -> Decimal | None:
+        if self._current_valuation is None:
+            return None
+        value = self._current_valuation["net_liquidation_equity_usd"]
+        return Decimal(value) if value is not None else None
+
+    def _has_positive_equity(self) -> bool:
+        equity = self._equity()
+        return equity is not None and equity.is_finite() and equity > 0
+
     def _resolve_orders(self, t: datetime) -> None:
         assert self.profile.execution is not None
         ex = self.profile.execution
-        for order in sorted(self.state.orders.values(), key=lambda o: o.order_id):
+        for order in sorted(
+            self.state.orders.values(), key=lambda o: (o.intent is OrderIntent.OPEN, o.order_id)
+        ):
             if order.status is not OrderStatus.PENDING:
+                continue
+            if t < order.first_eligible_at_utc:
+                continue
+            if t > order.first_eligible_at_utc:
+                self._expire_order(order, t, "EXPIRED")
+                continue
+            last_trading = order.spread.short.last_trading_at_utc
+            if last_trading is not None and t >= last_trading:
+                self._expire_order(order, t, "CONTRACT_NOT_TRADABLE")
                 continue
             fee_leg = (
                 ex.closing_fee_per_leg_usd
                 if order.intent is OrderIntent.CLOSE
                 else ex.opening_fee_per_leg_usd
             ) or Decimal(0)
-            max_quote_age = (
-                self.profile.quality.max_quote_age_seconds if self.profile.quality else None
-            )
-            sq_row = self.archive.quote_at(
-                order.spread.short.contract_id, t, max_age_seconds=max_quote_age
-            )
-            lq_row = self.archive.quote_at(
-                order.spread.long.contract_id, t, max_age_seconds=max_quote_age
-            )
-            short_q = _quote_from_row(sq_row) if sq_row else None
-            long_q = _quote_from_row(lq_row) if lq_row else None
+            short_q, long_q = self._pair(order.spread, t)
             pkg = PackageOrder(
                 order_id=order.order_id,
                 intent=Intent[order.intent.name],
@@ -270,16 +814,30 @@ class Engine:
             )
             outcome = try_fill(pkg, short_q, long_q, t)
             if outcome.status is FillStatus.FILLED and outcome.package_price_points is not None:
+                if not on_increment(
+                    outcome.package_price_points, order.spread.short.price_increment
+                ):
+                    raise DataPause("PACKAGE_PRICE_INCREMENT")
+                if order.intent is OrderIntent.OPEN:
+                    credit = outcome.package_price_points
+                    if credit <= 0 or credit >= order.spread.width_points:
+                        raise DataPause("INVALID_OPEN_CREDIT")
+                    assert self.profile.portfolio is not None
+                    maximum = self.profile.portfolio.max_per_spread_initial_risk_usd
+                    risk = (order.spread.width_points - credit) * order.spread.multiplier
+                    if maximum is not None and risk > maximum:
+                        self._expire_order(order, t, "RISK_LIMIT_AT_FILL")
+                        continue
                 fees = usd(fee_leg * 2)
                 self._apply_fill(order, outcome.package_price_points, fees, t)
             elif outcome.status in (
                 FillStatus.LIMIT_NOT_MET,
                 FillStatus.EXPIRED,
-                FillStatus.QUOTE_MISSING,
-                FillStatus.QUOTE_UNUSABLE,
                 FillStatus.SIZE_INADEQUATE,
             ):
                 self._expire_order(order, t, outcome.status.name)
+            elif outcome.status in (FillStatus.QUOTE_MISSING, FillStatus.QUOTE_UNUSABLE):
+                raise DataPause(outcome.status.name)
             # NOT_YET_ELIGIBLE: leave pending
 
     def _expire_order(self, order: Order, t: datetime, reason: str) -> None:
@@ -311,6 +869,7 @@ class Engine:
             self._agent_state(order.agent_id, "OPEN", t, self._next_grid(t))
 
     def _apply_fill(self, order: Order, price: Decimal, fees: Decimal, t: datetime) -> None:
+        short, long = self._pair(order.spread, t)
         self._emit(
             t,
             "ORDER",
@@ -320,6 +879,21 @@ class Engine:
                 "status": "FILLED",
                 "price_points": str(price),
                 "fees_usd": str(fees),
+                "fill_id": f"{order.order_id}:fill",
+                "execution_policy_id": "natural_quote_sides:first_eligible_minute:v2.1",
+                "price_increment_points": str(order.spread.short.price_increment),
+                "source_quotes": [
+                    {
+                        "contract_id": q.contract_id,
+                        "snapshot_at": q.snapshot_at_utc.isoformat(),
+                        "available_at": q.simulated_available_at_utc.isoformat(),
+                        "bid_points": str(q.bid_points),
+                        "ask_points": str(q.ask_points),
+                        "bid_size_contracts": q.bid_size_contracts,
+                        "ask_size_contracts": q.ask_size_contracts,
+                    }
+                    for q in (short, long)
+                ],
             },
         )
         agent = self.state.agents[order.agent_id]
@@ -349,6 +923,8 @@ class Engine:
                         "entry_at_utc": t.isoformat(),
                         "entry_ny_date": self.calendar.ny_date(t).isoformat(),
                         "reserve_usd": str(res.reserve_usd),
+                        "entry_order_id": order.order_id,
+                        "entry_fill_id": f"{order.order_id}:fill",
                     },
                 },
             )
@@ -364,6 +940,8 @@ class Engine:
                     "close_debit_points": str(price),
                     "fees_usd": str(fees),
                     "final_status": "CLOSED",
+                    "exit_order_id": order.order_id,
+                    "exit_fill_id": f"{order.order_id}:fill",
                 },
             )
             self._retire_agent(order.agent_id, t, "CLOSED")
@@ -429,15 +1007,13 @@ class Engine:
             )
         return tuple(facts)
 
-    def _manager_review(
-        self, t: datetime, sess: SessionDay, offset: int, session_index: int
-    ) -> None:
-        p = self.profile
-        assert p.portfolio is not None
+    def _manager_context(self, t: datetime, offset: int, session_index: int) -> DecisionContext:
+        assert self.profile.portfolio is not None
+        portfolio = self.profile.portfolio
         counts = self._direction_counts()
-        capacity = p.portfolio.max_open_or_reserved_slots
-        ratio = p.portfolio.bullish_weight / max(p.portfolio.bearish_weight, 1)
-        bull_target = round(capacity * ratio / (ratio + 1))
+        capacity = portfolio.max_open_or_reserved_slots
+        total_weight = portfolio.bullish_weight + portfolio.bearish_weight
+        bull_target = (capacity * portfolio.bullish_weight + total_weight // 2) // total_weight
         view = ManagerView(
             as_of_utc=t,
             active_bullish=counts["active_bull"],
@@ -447,7 +1023,7 @@ class Engine:
             capacity=capacity,
             bullish_target=bull_target,
             bearish_target=capacity - bull_target,
-            paused=self.state.paused,
+            paused=self.state.paused or not self._has_positive_equity(),
             available_usd=self.state.account.available(),
             reservations=tuple(
                 r
@@ -455,57 +1031,198 @@ class Engine:
                 if r.status is ReservationStatus.SEEKING_ENTRY
             ),
             macro_facts=self._macro_facts(t),
+            equity_usd=self._equity(),
         )
-        ctx = DecisionContext(
+        return DecisionContext(
             self.run_id,
             self.branch_id,
             "manager-1",
             "MANAGER",
             t,
-            session_index=session_index,
-            minute_from_open=offset,
+            session_index,
+            offset,
             manager_view=view,
+            base_ledger_seq=self._base_tip[0],
+            base_ledger_hash=self._base_tip[1],
+            barrier_id=self._barrier_id,
         )
-        pol: Policy | None = None
+
+    def _decision_barrier(
+        self,
+        sess: SessionDay,
+        t: datetime,
+        offset: int,
+        session_index: int,
+        on_grid: bool,
+    ) -> None:
+        """All due actors observe one state; no accepted action commits before the last response."""
+        assert self.profile.clock is not None
+        self._base_tip = self.store.tip(self.run_id)
+        self._barrier_id = f"{self.branch_id}:{t.isoformat()}:DECISION"
+        cutoff = self.profile.study.scored_end_date if self.profile.study else None
+        runoff = cutoff is not None and sess.day > cutoff
+        contexts: list[DecisionContext] = []
+        manager_due = (
+            self._manager_due and offset >= self.profile.clock.agent_review_minutes and not runoff
+        )
+        if manager_due:
+            contexts.append(self._manager_context(t, offset, session_index))
+        if on_grid:
+            for agent in sorted(self.state.live_agents(), key=lambda a: a.agent_id):
+                if agent.role != "SPREAD" or agent.next_review_at_utc > t:
+                    continue
+                if agent.state not in (AgentState.SEEKING_ENTRY, AgentState.OPEN):
+                    continue
+                if runoff and agent.state is AgentState.SEEKING_ENTRY:
+                    continue
+                pos = self.state.positions.get(agent.position_id or "")
+                if pos is not None and t >= self._last_trading_time(pos):
+                    continue
+                view = self._spread_view(agent, sess, t)
+                contexts.append(
+                    DecisionContext(
+                        self.run_id,
+                        self.branch_id,
+                        agent.agent_id,
+                        "SPREAD",
+                        t,
+                        session_index,
+                        offset,
+                        spread_view=view,
+                        base_ledger_seq=self._base_tip[0],
+                        base_ledger_hash=self._base_tip[1],
+                        barrier_id=self._barrier_id,
+                    )
+                )
+        prepared: list[
+            tuple[Policy, DecisionContext, Proposal, dict[str, Any] | None, str | None]
+        ] = []
         try:
-            pol = self.policy_provider("MANAGER")
-            proposal = pol.decide(ctx)
-            validate_manager_proposal(ctx, proposal)
-            self._check_manager_capacity(proposal, t)
-        except PolicyError as e:
-            self._discard_pending(pol, ctx)
-            self._emit(t, "DECISION", "BARRIER_PAUSED", {"actor_id": "manager-1", "code": e.code})
-            return
-        except Rejection as e:
-            self._discard_pending(pol, ctx)
-            self.decisions.append(
+            for ctx in contexts:
+                policy = self.policy_provider(ctx.role)
+                try:
+                    proposal = policy.decide(ctx)
+                except BaseException:
+                    self._discard_pending(policy, ctx)
+                    raise
+                rejection = None
+                try:
+                    if ctx.role == "MANAGER":
+                        validate_manager_proposal(ctx, proposal)
+                        self._check_manager_capacity(proposal, t)
+                    else:
+                        validate_spread_proposal(ctx, proposal)
+                except Rejection as exc:
+                    rejection = exc.code
+                witness = deepcopy(getattr(policy, "last_witness", None))
+                prepared.append((policy, ctx, proposal, witness, rejection))
+        except BaseException:
+            for policy, ctx, *_ in prepared:
+                self._discard_pending(policy, ctx)
+            raise
+        assessments: list[Any] = []
+        observations: dict[str, Any] = {"atoms": [], "deliveries": []}
+        accepted: list[tuple[Policy, DecisionContext]] = []
+        rejected: list[tuple[Policy, DecisionContext]] = []
+
+        def commit_actions() -> None:
+            unique_findings = {json.dumps(f, sort_keys=True): f for f in self._candidate_findings}
+            for key in sorted(unique_findings):
+                self._emit(t, "DATA", "DATA_QUALITY_FINDING", unique_findings[key])
+            if manager_due:
+                self._manager_due = False
+            for policy, ctx, proposal, witness, reason in prepared:
+                # Manager retirement/allocation can invalidate a spread proposal from
+                # the frozen view. Record the deterministic rejection, never resample.
+                if reason is None and ctx.role == "SPREAD":
+                    current = self.state.agents.get(ctx.actor_id)
+                    previous = ctx.spread_view.agent if ctx.spread_view else None
+                    if current is None or previous is None or current.state is not previous.state:
+                        reason = "STATE_CHANGED_AT_COMMIT"
+                if reason is not None:
+                    if witness:
+                        self._emit(t, "DECISION", "DECISION_WITNESS", witness)
+                    self._emit(
+                        t,
+                        "DECISION",
+                        "DECISION_REJECTED",
+                        {
+                            "actor_id": ctx.actor_id,
+                            "kind": proposal.kind,
+                            "code": reason,
+                            **(
+                                {
+                                    "private_decision_id": witness["private_decision_id"],
+                                    "request_hash": witness["request_hash"],
+                                }
+                                if witness
+                                and "private_decision_id" in witness
+                                and "request_hash" in witness
+                                else {}
+                            ),
+                        },
+                    )
+                    rejected.append((policy, ctx))
+                    continue
+                if witness:
+                    self._emit(t, "DECISION", "DECISION_WITNESS", witness)
+                self._emit(
+                    t,
+                    "DECISION",
+                    "DECISION_MADE",
+                    {
+                        "actor_id": ctx.actor_id,
+                        "kind": proposal.kind,
+                        "reason_codes": list(proposal.reason_codes),
+                        "barrier_id": self._barrier_id,
+                    },
+                )
+                if ctx.role == "MANAGER":
+                    self._apply_manager(t, proposal)
+                else:
+                    assert ctx.spread_view is not None
+                    self._apply_spread(ctx.spread_view.agent, ctx.spread_view, t, proposal)
+                staged = getattr(policy, "staged_assessments", None)
+                if callable(staged):
+                    assessments.extend(staged(ctx))
+                staged_obs = getattr(policy, "staged_observations", None)
+                if callable(staged_obs):
+                    bundle = staged_obs(ctx)
+                    if isinstance(bundle, tuple):
+                        atoms, deliveries = bundle
+                    else:
+                        atoms, deliveries = bundle.get("atoms", []), bundle.get("deliveries", [])
+                    observations["atoms"].extend(atoms)
+                    observations["deliveries"].extend(deliveries)
+                accepted.append((policy, ctx))
+
+        try:
+            self._atomic(
+                t,
+                "DECISION",
+                commit_actions,
                 {
-                    "actor": "manager-1",
-                    "at": t.isoformat(),
-                    "proposal": proposal.kind,
-                    "rejected": e.code,
-                }
+                    "session_index": session_index,
+                    "minute_offset": offset + 1,
+                    "next_phase": "MARKET",
+                    "simulated_at": t.isoformat(),
+                },
+                assessments=assessments,
+                observations=observations,
             )
-            self._emit(
-                t, "DECISION", "DECISION_REJECTED", {"actor_id": "manager-1", "code": e.code}
-            )
-            return
-        self.decisions.append(
-            {"actor": "manager-1", "at": t.isoformat(), "proposal": proposal.kind}
-        )
-        self._emit_witness(t, pol)
-        self._emit(
-            t,
-            "DECISION",
-            "DECISION_MADE",
-            {
-                "actor_id": "manager-1",
-                "kind": proposal.kind,
-                "reason_codes": list(proposal.reason_codes),
-            },
-        )
-        self._apply_manager(t, proposal)
-        self._commit_pending(pol, ctx)
+        except BaseException:
+            for policy, ctx, *_ in prepared:
+                self._discard_pending(policy, ctx)
+            raise
+        for policy, ctx in rejected:
+            self._discard_pending(policy, ctx)
+        durable = callable(getattr(self.store, "commit_barrier", None))
+        for policy, ctx in accepted:
+            finalize = getattr(policy, "finalize", None)
+            if durable and callable(finalize):
+                finalize(ctx, persisted=True)
+            else:
+                self._commit_pending(policy, ctx)
 
     def _reservation_reserve_usd(self, t: datetime) -> Decimal:
         """Full-width encumbrance for any candidate using the real contract
@@ -547,14 +1264,13 @@ class Engine:
         allocation regardless of actual risk."""
         if p.kind != "ALLOCATE" or not p.allocation:
             return
+        if not self._has_positive_equity():
+            raise Rejection("EQUITY_NOT_POSITIVE")
         assert self.profile.portfolio is not None
         reserve = self._reservation_reserve_usd(t)
         n_new = sum(p.allocation.values())
         aggregate = self.profile.portfolio.max_aggregate_committed_risk_usd
-        if (
-            aggregate is not None
-            and self._committed_risk_usd() + reserve * n_new > aggregate
-        ):
+        if aggregate is not None and self._committed_risk_usd() + reserve * n_new > aggregate:
             raise Rejection("RESERVE_EXCEEDS_RISK_LIMIT")
 
     def _apply_manager(self, t: datetime, p: Proposal) -> None:
@@ -605,9 +1321,7 @@ class Engine:
                         },
                     )
             shortfall = {
-                k: requested[k] - allocated[k]
-                for k in requested
-                if allocated[k] < requested[k]
+                k: requested[k] - allocated[k] for k in requested if allocated[k] < requested[k]
             }
             if shortfall:
                 self._emit(
@@ -636,71 +1350,10 @@ class Engine:
                 )
                 self._retire_agent(res.agent_id, t, "CANCELLED")
 
-    def _spread_reviews(
-        self, sess: SessionDay, t: datetime, offset: int, session_index: int
-    ) -> None:
-        for agent in sorted(self.state.live_agents(), key=lambda a: a.agent_id):
-            if agent.role != "SPREAD" or agent.next_review_at_utc > t:
-                continue
-            if agent.state not in (AgentState.SEEKING_ENTRY, AgentState.OPEN):
-                continue
-            view = self._spread_view(agent, sess, t)
-            ctx = DecisionContext(
-                self.run_id,
-                self.branch_id,
-                agent.agent_id,
-                "SPREAD",
-                t,
-                session_index=session_index,
-                minute_from_open=offset,
-                spread_view=view,
-            )
-            pol: Policy | None = None
-            try:
-                pol = self.policy_provider("SPREAD")
-                proposal = pol.decide(ctx)
-                validate_spread_proposal(ctx, proposal)
-            except PolicyError as e:
-                self._discard_pending(pol, ctx)
-                self._emit(
-                    t, "DECISION", "BARRIER_PAUSED", {"actor_id": agent.agent_id, "code": e.code}
-                )
-                continue
-            except Rejection as e:
-                self._discard_pending(pol, ctx)
-                self.decisions.append(
-                    {
-                        "actor": agent.agent_id,
-                        "at": t.isoformat(),
-                        "proposal": proposal.kind,
-                        "rejected": e.code,
-                    }
-                )
-                self._emit(
-                    t, "DECISION", "DECISION_REJECTED", {"actor_id": agent.agent_id, "code": e.code}
-                )
-                continue
-            self.decisions.append(
-                {"actor": agent.agent_id, "at": t.isoformat(), "proposal": proposal.kind}
-            )
-            self._emit_witness(t, pol)
-            self._emit(
-                t,
-                "DECISION",
-                "DECISION_MADE",
-                {
-                    "actor_id": agent.agent_id,
-                    "kind": proposal.kind,
-                    "reason_codes": list(proposal.reason_codes),
-                },
-            )
-            self._apply_spread(agent, view, t, proposal)
-            self._commit_pending(pol, ctx)
-
     def _spread_view(self, agent: Any, sess: SessionDay, t: datetime) -> SpreadView:
         quality = self.profile.quality
-        max_quote_age = quality.max_quote_age_seconds if quality else None
-        max_greek_age = quality.max_greek_age_seconds if quality else None
+        max_quote_age = quality.max_quote_age_seconds if quality else 300
+        max_greek_age = quality.max_greek_age_seconds if quality else 86400
         require_validated = bool(
             getattr(self.profile.universe, "delta_requires_validated_source", True)
             and getattr(quality, "fail_on_unvalidated_greeks_for_delta_filter", True)
@@ -709,63 +1362,96 @@ class Engine:
         close_debit, frac, days = None, None, 0
         if pos and pos.status is PositionStatus.OPEN:
             assert self.profile.execution is not None
-            sq = self.archive.quote_at(
-                pos.spread.short.contract_id, t, max_age_seconds=max_quote_age
+            sq, lq = self._pair(pos.spread, t)
+            close_debit = sq.ask_points - lq.bid_points
+            fee = self.profile.execution.closing_fee_per_leg_usd or Decimal(0)
+            pnl = estimated_liquidation_pnl_usd(
+                pos.entry_credit_points,
+                close_debit,
+                pos.spread.multiplier,
+                pos.entry_fees_usd,
+                usd(fee * 2),
             )
-            lq = self.archive.quote_at(
-                pos.spread.long.contract_id, t, max_age_seconds=max_quote_age
-            )
-            if sq and lq:
-                close_debit = Decimal(str(sq["ask_points"])) - Decimal(str(lq["bid_points"]))
-                fee = self.profile.execution.closing_fee_per_leg_usd or Decimal(0)
-                pnl = estimated_liquidation_pnl_usd(
-                    pos.entry_credit_points,
-                    close_debit,
-                    pos.spread.multiplier,
-                    pos.entry_fees_usd,
-                    usd(fee * 2),
-                )
-                gross = pos.entry_credit_points * pos.spread.multiplier
-                frac = pnl / gross if gross > 0 else None
+            gross = pos.entry_credit_points * pos.spread.multiplier
+            frac = pnl / gross if gross > 0 else None
             days = (sess.day - pos.entry_ny_date).days
         cands: tuple[Candidate, ...] = ()
         entry_tpls: tuple[LimitTemplate, ...] = ()
-        if agent.state is AgentState.SEEKING_ENTRY:
+        if agent.state is AgentState.SEEKING_ENTRY and self._has_positive_equity():
             assert self.profile.universe is not None
             assert self.profile.portfolio is not None
             res = self.state.reservations[agent.reservation_id or ""]
-            cands = tuple(
-                build_candidates(
-                    self.archive,
-                    t,
-                    sess.day,
-                    res.direction,
-                    dte_range=self.profile.universe.entry_dte_range,
-                    widths=self.profile.universe.spread_widths_index_points,
-                    delta_range=self.profile.universe.short_abs_delta_range,
-                    reserve_per_spread_usd=res.reserve_usd,
-                    max_risk_usd=self.profile.portfolio.max_per_spread_initial_risk_usd,
-                    max_candidates=self.profile.universe.max_candidates_per_direction,
-                    target_dte=self.profile.universe.target_entry_dte_calendar_days,
-                    allowed_roots=tuple(self.profile.universe.allowed_contract_roots),
-                    max_quote_age_seconds=max_quote_age,
-                    max_greek_age_seconds=max_greek_age,
-                    require_validated_greeks=require_validated,
+            health_check = getattr(self.archive, "session_health", None)
+            if callable(health_check):
+                health = health_check(t, max_quote_age)
+                if health != "HEALTHY":
+                    raise DataPause(health)
+            key = (t, res.direction, res.reserve_usd)
+            if key not in self._candidate_cache:
+                self._candidate_cache[key] = tuple(
+                    build_candidates(
+                        self.archive,
+                        t,
+                        sess.day,
+                        res.direction,
+                        dte_range=self.profile.universe.entry_dte_range,
+                        widths=self.profile.universe.spread_widths_index_points,
+                        delta_range=self.profile.universe.short_abs_delta_range,
+                        reserve_per_spread_usd=res.reserve_usd,
+                        max_risk_usd=self.profile.portfolio.max_per_spread_initial_risk_usd,
+                        max_candidates=self.profile.universe.max_candidates_per_direction,
+                        target_dte=self.profile.universe.target_entry_dte_calendar_days,
+                        allowed_roots=tuple(self.profile.universe.allowed_contract_roots),
+                        max_quote_age_seconds=max_quote_age,
+                        max_greek_age_seconds=max_greek_age,
+                        require_validated_greeks=require_validated,
+                        max_event_age_seconds=(
+                            self.profile.execution.max_known_quote_age_seconds
+                            if self.profile.execution
+                            else 60
+                        ),
+                        findings=self._candidate_findings,
+                    )
                 )
-            )
+            cands = self._candidate_cache[key]
             # One approved limit template per candidate (natural quote-side credit).
             entry_tpls = tuple(
                 LimitTemplate(f"entry:{c.candidate_id}", "NATURAL", c.credit_points) for c in cands
             )
         exit_tpls: tuple[LimitTemplate, ...] = ()
-        if pos and close_debit is not None and close_debit > 0:
+        if pos and close_debit is not None and close_debit >= 0:
             exit_tpls = (LimitTemplate("exit-natural", "NATURAL", close_debit),)
-        return SpreadView(agent, pos, close_debit, frac, days, cands, entry_tpls, exit_tpls)
+        assert self.profile.exit_policy is not None
+        exit_policy = self.profile.exit_policy
+        index_reader = getattr(self.archive, "index_at", None)
+        index = index_reader(t) if callable(index_reader) else None
+        return SpreadView(
+            agent,
+            pos,
+            close_debit,
+            frac,
+            days,
+            cands,
+            entry_tpls,
+            exit_tpls,
+            equity_usd=self._equity(),
+            as_of_dte=(pos.spread.dte_calendar_days(sess.day) if pos else None),
+            advisory_profit_low=exit_policy.profit_review_band[0],
+            advisory_profit_high=exit_policy.profit_review_band[1],
+            advisory_loss_low=exit_policy.loss_review_band[0],
+            advisory_loss_high=exit_policy.loss_review_band[1],
+            loss_activation_days=exit_policy.loss_activation_days_held,
+            macro_facts=self._macro_facts(t),
+            spot_points=(Decimal(str(index["value_index_points"])) if index else None),
+        )
 
     def _apply_spread(self, agent: Any, view: SpreadView, t: datetime, p: Proposal) -> None:
         assert self.profile.clock is not None
         delay = timedelta(seconds=self.profile.clock.simulated_execution_delay_seconds)
         if p.kind == "OPEN":
+            cutoff = self.profile.study.scored_end_date if self.profile.study else None
+            if cutoff is not None and self.calendar.ny_date(t) > cutoff:
+                raise Rejection("ENTRY_AFTER_SCORED_END")
             cand = next(c for c in view.candidates if c.candidate_id == p.candidate_id)
             tpl = next(
                 t2 for t2 in view.entry_limit_templates if t2.template_id == p.limit_template_id
@@ -898,4 +1584,14 @@ class Engine:
 
     def _next_grid(self, t: datetime) -> datetime:
         assert self.profile.clock is not None
-        return t + timedelta(minutes=self.profile.clock.agent_review_minutes)
+        for session in self.calendar.sessions:
+            if session.day < self.calendar.ny_date(t):
+                continue
+            for review in self.calendar.review_times(
+                session.day, self.profile.clock.agent_review_minutes
+            ):
+                if review > t:
+                    return review
+        # End-of-calendar marker: no real review exists here; the run cannot
+        # execute this timestamp because it is outside the immutable calendar.
+        return t + timedelta(days=1)

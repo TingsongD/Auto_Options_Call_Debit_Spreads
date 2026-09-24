@@ -13,10 +13,7 @@ from pathlib import Path
 import pytest
 import sqlalchemy as sa
 
-DSN = os.environ.get(
-    "SPX_TEST_DSN",
-    "postgresql+psycopg://spx_dev:spx_dev_local_only@127.0.0.1:5433/spx_research",
-)
+DSN = os.environ.get("SPX_TEST_DSN")
 
 
 def _available(dsn: str) -> bool:
@@ -30,7 +27,9 @@ def _available(dsn: str) -> bool:
 
 @pytest.fixture(scope="session")
 def pg_engine() -> Iterator[sa.engine.Engine]:
-    if not _available(DSN):
+    if not DSN or not _available(DSN):
+        if os.environ.get("SPX_REQUIRE_POSTGRES") == "1":
+            pytest.fail("explicit SPX_TEST_DSN is required and must be reachable")
         pytest.skip("SPX_TEST_DSN postgres unavailable")
     engine = sa.create_engine(DSN)
     # apply migrations once per session

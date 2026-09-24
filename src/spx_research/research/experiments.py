@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -40,6 +41,8 @@ class Experiment:
     code_version: str | None
     study_label: str
     registered_at_utc: str
+    format_version: int = 1
+    input_sha256: str | None = None
 
 
 def experiment_id(
@@ -61,7 +64,7 @@ def experiment_id(
 
 
 class ExperimentRegistry:
-    """Append-only JSONL registry; keyed by experiment_id."""
+    """Append-only JSONL registry; one entry per distinct run ID."""
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
@@ -70,7 +73,7 @@ class ExperimentRegistry:
             for line in self.path.read_text().splitlines():
                 if line.strip():
                     e = Experiment(**json.loads(line))
-                    self._records[e.experiment_id] = e
+                    self._records[e.run_id] = e
 
     def register(
         self,
@@ -89,8 +92,11 @@ class ExperimentRegistry:
             tape_sha256=_sha_file(tape_path),
             code_version=code_version,
         )
-        if eid in self._records:
-            return self._records[eid]
+        if run_id in self._records:
+            previous = self._records[run_id]
+            if previous.experiment_id != eid:
+                raise ValueError("RUN_ID_REUSED_WITH_DIFFERENT_INPUTS")
+            return previous
         rec = Experiment(
             experiment_id=eid,
             run_id=run_id,
@@ -105,11 +111,47 @@ class ExperimentRegistry:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.path.open("a") as fh:
             fh.write(json.dumps(asdict(rec), sort_keys=True) + "\n")
-        self._records[eid] = rec
+        self._records[run_id] = rec
+        return rec
+
+    def register_manifest(self, manifest: dict[str, Any]) -> Experiment:
+        """Register frozen execution inputs, preserving every run in a group."""
+        from spx_research.research.artifacts import digest, validate_frozen_manifest
+
+        validate_frozen_manifest(manifest)
+        inputs = manifest["inputs"]
+        run_id = str(manifest["run_id"])
+        eid = "exp-" + str(manifest["input_sha256"])[:24]
+        if run_id in self._records:
+            old = self._records[run_id]
+            if old.input_sha256 != manifest["input_sha256"]:
+                raise ValueError("RUN_ID_REUSED_WITH_DIFFERENT_INPUTS")
+            return old
+        rec = Experiment(
+            experiment_id=eid,
+            run_id=run_id,
+            profile_sha256=digest(inputs["profile"]),
+            dataset_manifest_id=inputs["dataset_manifest_id"],
+            model_id=json.dumps(
+                inputs.get("policy_meta", {}).get("resolved_model_ids", {}), sort_keys=True
+            ),
+            tape_sha256=inputs.get("policy_meta", {}).get("replay_source", {}).get("sha256"),
+            code_version=inputs["code"]["source_sha256"],
+            study_label=STUDY_LABEL,
+            registered_at_utc=datetime.now(UTC).isoformat(),
+            format_version=2,
+            input_sha256=manifest["input_sha256"],
+        )
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("a") as fh:
+            fh.write(json.dumps(asdict(rec), sort_keys=True) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        self._records[run_id] = rec
         return rec
 
     def list(self) -> list[Experiment]:
         return sorted(self._records.values(), key=lambda e: e.registered_at_utc)
 
     def get(self, experiment_id: str) -> Experiment | None:
-        return self._records.get(experiment_id)
+        return next((r for r in self._records.values() if r.experiment_id == experiment_id), None)

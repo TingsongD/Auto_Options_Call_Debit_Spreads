@@ -27,8 +27,10 @@ def _hhmm(v: Any) -> time:
         return v
     if isinstance(v, str):
         try:
-            hh, mm = v.split(":")
-            return time(int(hh), int(mm))
+            parsed = time.fromisoformat(v)
+            if parsed.second or parsed.microsecond or parsed.tzinfo is not None:
+                raise ValueError("session time must be a local whole minute")
+            return parsed
         except ValueError as exc:
             raise ValueError(f"expected HH:MM, got {v!r}") from exc
     raise ValueError(f"expected HH:MM, got {v!r}")
@@ -176,6 +178,7 @@ class Execution(Section):
     opening_fee_per_leg_usd: Decimal | None = None
     closing_fee_per_leg_usd: Decimal | None = None
     settlement_fee_profile_id: str | None = None
+    settlement_fee_per_leg_usd: Decimal | None = None
     settlement_cash_availability_policy_id: str | None = None
 
 
@@ -194,7 +197,7 @@ class Models(Section):
     spread_role_candidate: str | None = None
     manager_role_candidate: str | None = None
     resolved_model_ids_manifest: str | None = None
-    prompt_version: str = "v2-tkh-draft"
+    prompt_version: str = "v2.1"
     structured_output: Literal[True] = True
     store: Literal[False] = False
     unrestricted_tools: Literal[False] = False
@@ -205,11 +208,22 @@ class Models(Section):
     max_output_tokens_per_call: int = 800
     price_sheet_id: str | None = None
     experiment_api_budget_usd: Decimal | None = None
+    model_context_limits: dict[str, int] = {}
     budget_action: str = "checkpoint_and_pause"
     provider_managed_conversation: Literal[False] = False
     previous_response_id: None = None
     opaque_reasoning_replay: Literal[False] = False
     uninspected_compaction: Literal[False] = False
+
+    @model_validator(mode="after")
+    def _bounded_requests(self) -> Self:
+        if self.maximum_concurrent_requests < 1 or self.retry_attempts_after_initial < 0:
+            raise ValueError("concurrency must be positive and retries nonnegative")
+        if not 1 <= self.max_output_tokens_per_call <= 32768:
+            raise ValueError("max_output_tokens_per_call must be between 1 and 32768")
+        if any(limit <= 0 for limit in self.model_context_limits.values()):
+            raise ValueError("model context limits must be positive")
+        return self
 
 
 class Quality(Section):
@@ -232,7 +246,7 @@ class Quality(Section):
 
 class HarnessCfg(Section):
     name: str = "TemporalKnowledgeHarness"
-    version: str = "2.0-draft"
+    version: str = "2.1"
     view_mode: str = "asof_blinded"
     knowledge_contract: str = "verified_observation_and_typed_assessment"
     claim_parametric_ignorance: Literal[False] = False

@@ -1,6 +1,6 @@
 # spx-research
 
-Application scaffold for the SPX credit-spread research platform. The governing
+Synthetic SPX credit-spread research engine with durable decision recovery. The governing
 specification lives one level up in `../spx_ai_handover_v2/` — read
 `DEV_HANDOVER.md`, `docs/TEMPORAL_HARNESS.md`, and `docs/LEAKAGE_EVALUATION.md`
 before implementing. `docs/DECISIONS.md` there lists owner approvals that remain
@@ -22,11 +22,27 @@ unchecked — this codebase is a tested scaffold, not an approved system.
 ## Commands
 
 ```bash
-uv sync            # create/update .venv from uv.lock (Python 3.12)
-uv run pytest      # unit + property + integration tests (synthetic only, no network)
+uv sync --frozen    # install the locked environment (Python 3.12)
+uv run pytest      # synthetic tests; see acceptance matrix for mandatory service checks
 uv run ruff check  # lint
 uv run mypy src    # type check
 ```
+
+## Documentation
+
+- [User guide](docs/USER_GUIDE.md): first synthetic run, mock decisions, reading
+  results, replay, and recovery.
+- [Operations runbook](docs/RUNBOOK.md): PostgreSQL, spending controls, isolated
+  inference, backups, and incident handling.
+- [Development log](docs/DEV_LOG.md): dated changes, verification, and remaining work.
+- [Acceptance matrix](docs/ACCEPTANCE_MATRIX.md): review findings mapped to regressions.
+- [Implementation validation](docs/IMPLEMENTATION_VALIDATION.md): recorded results
+  from the September 21 patch acceptance run.
+- [Decision register](docs/DECISION_REGISTER.md) and
+  [data-rights probe](docs/DATA_RIGHTS_PROBE.md): outstanding approval gates.
+
+Start with the user guide. It uses generated data and requires no provider key,
+paid calls, or database for the basic walkthrough.
 
 ## Boundaries (non-negotiable, from the spec)
 
@@ -40,3 +56,8 @@ uv run mypy src    # type check
   no provider-managed conversation state in the blinded profile.
 - Passing tests never labels a run as free of pretrained historical knowledge.
 - Secrets and licensed data stay out of git and telemetry.
+
+Runtime contracts, prompts, schemas and examples ship in the wheel. See
+[the runbook](docs/RUNBOOK.md) for frozen manifests, resume, budgets and Docker
+inference isolation, and [the acceptance matrix](docs/ACCEPTANCE_MATRIX.md) for
+verification and remaining gated historical work.

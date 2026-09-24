@@ -1,0 +1,56 @@
+# Offline acceptance: docker compose -f compose.isolation.yaml up -d mock-gateway
+# Workers are short-lived networkless containers launched by DockerGateway.
+services:
+  mock-gateway:
+    image: spx-inference:2.1
+    build:
+      context: .
+      dockerfile: Dockerfile.isolation
+    entrypoint: [python, /app/gateway_server.py]
+    command: [--mode, mock, --models, mock-1]
+    network_mode: none
+    user: '65532:65532'
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 64
+    mem_limit: 128m
+    cpus: 1
+    volumes: [gateway_socket:/run/spx]
+  provider-gateway:
+    profiles: [provider]
+    image: spx-inference:2.1
+    entrypoint: [python, /app/gateway_server.py]
+    command: [--mode, provider, --models, '${SPX_ALLOWED_MODELS:-DISABLED_NO_MODEL_APPROVED}']
+    network_mode: none
+    user: '65532:65532'
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 64
+    mem_limit: 128m
+    cpus: 1
+    volumes: [provider_gateway_socket:/run/spx, provider_egress_socket:/run/egress]
+    secrets: [provider_key]
+  provider-proxy:
+    profiles: [provider]
+    image: spx-inference:2.1
+    entrypoint: [python, /app/egress_proxy.py]
+    command: [--models, '${SPX_ALLOWED_MODELS:-DISABLED_NO_MODEL_APPROVED}']
+    user: '65532:65532'
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 64
+    mem_limit: 128m
+    cpus: 1
+    volumes: [provider_egress_socket:/run/egress]
+volumes:
+  gateway_socket:
+    name: spx_mock_gateway_socket
+  provider_gateway_socket:
+    name: spx_provider_gateway_socket
+  provider_egress_socket:
+secrets:
+  provider_key:
+    file: ${SPX_PROVIDER_KEY_FILE:-/dev/null}

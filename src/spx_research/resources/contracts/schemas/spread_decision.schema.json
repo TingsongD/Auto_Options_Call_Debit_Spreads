@@ -1,0 +1,262 @@
+{
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "enum": [
+        "2.1"
+      ]
+    },
+    "actor_role": {
+      "type": "string",
+      "enum": [
+        "SPREAD"
+      ]
+    },
+    "decision_token": {
+      "type": "string"
+    },
+    "packet_token": {
+      "type": "string"
+    },
+    "prior_belief_token": {
+      "type": "string"
+    },
+    "action_id": {
+      "type": "string"
+    },
+    "premise_tokens": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "assessment_updates": {
+      "type": "array",
+      "items": {
+        "anyOf": [
+          {
+            "type": "object",
+            "properties": {
+              "topic": {
+                "type": "string",
+                "enum": [
+                  "POLICY_DIRECTION"
+                ]
+              },
+              "assessment": {
+                "type": "string",
+                "enum": [
+                  "TIGHTENING_RECENTLY",
+                  "EASING_RECENTLY",
+                  "NO_CLEAR_CHANGE"
+                ]
+              },
+              "premise_tokens": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "confidence_label": {
+                "type": "string",
+                "enum": [
+                  "LOW",
+                  "MEDIUM",
+                  "HIGH",
+                  "UNASSESSABLE"
+                ]
+              }
+            },
+            "required": [
+              "topic",
+              "assessment",
+              "premise_tokens",
+              "confidence_label"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "topic": {
+                "type": "string",
+                "enum": [
+                  "RATE_OUTLOOK"
+                ]
+              },
+              "assessment": {
+                "type": "string",
+                "enum": [
+                  "CUTS_PLAUSIBLE",
+                  "HIKES_PLAUSIBLE",
+                  "UNCERTAIN"
+                ]
+              },
+              "premise_tokens": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "confidence_label": {
+                "type": "string",
+                "enum": [
+                  "LOW",
+                  "MEDIUM",
+                  "HIGH",
+                  "UNASSESSABLE"
+                ]
+              }
+            },
+            "required": [
+              "topic",
+              "assessment",
+              "premise_tokens",
+              "confidence_label"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "topic": {
+                "type": "string",
+                "enum": [
+                  "RISK_OUTLOOK"
+                ]
+              },
+              "assessment": {
+                "type": "string",
+                "enum": [
+                  "ELEVATED_RISK",
+                  "ORDINARY_RISK",
+                  "UNCERTAIN"
+                ]
+              },
+              "premise_tokens": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "confidence_label": {
+                "type": "string",
+                "enum": [
+                  "LOW",
+                  "MEDIUM",
+                  "HIGH",
+                  "UNASSESSABLE"
+                ]
+              }
+            },
+            "required": [
+              "topic",
+              "assessment",
+              "premise_tokens",
+              "confidence_label"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "topic": {
+                "type": "string",
+                "enum": [
+                  "MANAGEMENT_OUTLOOK"
+                ]
+              },
+              "assessment": {
+                "type": "string",
+                "enum": [
+                  "MAINTAIN",
+                  "RECONSIDER",
+                  "UNCERTAIN"
+                ]
+              },
+              "premise_tokens": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "confidence_label": {
+                "type": "string",
+                "enum": [
+                  "LOW",
+                  "MEDIUM",
+                  "HIGH",
+                  "UNASSESSABLE"
+                ]
+              }
+            },
+            "required": [
+              "topic",
+              "assessment",
+              "premise_tokens",
+              "confidence_label"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      }
+    },
+    "reason_codes": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": [
+          "POLICY_UNCERTAINTY",
+          "PROFIT_BAND",
+          "LOSS_BAND",
+          "RISK_BUDGET",
+          "ALLOCATION_DEFICIT",
+          "ENTRY_CRITERIA",
+          "QUOTE_QUALITY",
+          "MAINTAIN_THESIS",
+          "INSUFFICIENT_EVIDENCE",
+          "LIFECYCLE_RESTRICTION"
+        ]
+      }
+    },
+    "uncertainty_codes": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": [
+          "UNKNOWN_FUTURE_POLICY_PATH",
+          "UNKNOWN_FUTURE_PRICE_PATH",
+          "UNVERIFIED_PROBABILITY",
+          "AMBIGUOUS_MACRO",
+          "QUOTE_LIMITATION",
+          "DISCRETIONARY_LOSS_LIMIT",
+          "NONE_IDENTIFIED"
+        ]
+      }
+    },
+    "confidence_label": {
+      "type": "string",
+      "enum": [
+        "LOW",
+        "MEDIUM",
+        "HIGH",
+        "UNASSESSABLE"
+      ]
+    }
+  },
+  "required": [
+    "schema_version",
+    "actor_role",
+    "decision_token",
+    "packet_token",
+    "prior_belief_token",
+    "action_id",
+    "premise_tokens",
+    "assessment_updates",
+    "reason_codes",
+    "uncertainty_codes",
+    "confidence_label"
+  ],
+  "additionalProperties": false
+}

@@ -14,6 +14,8 @@ from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from spx_research.domain.types import require_aware
+
 NY = ZoneInfo("America/New_York")
 UTC_TZ = UTC
 
@@ -28,6 +30,12 @@ class SessionDay:
     open_local: time
     close_local: time
     half_day: bool = False
+
+    def __post_init__(self) -> None:
+        if self.open_local >= self.close_local:
+            raise CalendarError("INVALID_SESSION_HOURS")
+        if self.open_local.second or self.close_local.second:
+            raise CalendarError("SESSION_NOT_MINUTE_ALIGNED")
 
     def open_utc(self) -> datetime:
         return datetime.combine(self.day, self.open_local, tzinfo=NY).astimezone(UTC)
@@ -70,6 +78,8 @@ class CalendarManifest:
 
     def review_times(self, day: date, interval_minutes: int) -> list[datetime]:
         """Review grid: open+interval, then every interval, strictly before close."""
+        if interval_minutes <= 0:
+            raise CalendarError("INVALID_REVIEW_INTERVAL")
         s = self.session(day)
         if s is None:
             return []
@@ -87,7 +97,7 @@ class CalendarManifest:
         return s.open_utc() + timedelta(minutes=offset)
 
     def ny_date(self, t: datetime) -> date:
-        return t.astimezone(NY).date()
+        return require_aware(t).astimezone(NY).date()
 
 
 def _parse_time(v: str) -> time:

@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+from copy import deepcopy
+from threading import RLock
 from typing import Any, Protocol
 
 from spx_research.domain.state import Event
@@ -30,26 +32,40 @@ class EventStore(Protocol):
     def events(self, run_id: str) -> list[Event]: ...
     def tip(self, run_id: str) -> tuple[int, str]: ...
 
+    def append_batch(self, events: list[Event], expected_seq: int) -> list[Event]: ...
+
 
 class InMemoryEventStore:
     """Deterministic single-writer event log for tests and replay."""
 
     def __init__(self) -> None:
         self._events: dict[str, list[Event]] = {}
+        self._lock = RLock()
 
     def append(self, event: Event, expected_seq: int) -> Event:
-        events = self._events.setdefault(event.run_id, [])
-        seq, prev_hash = self.tip(event.run_id)
-        if expected_seq != seq:
-            raise LedgerError("SEQUENCE_MISMATCH")
-        e = event.with_hashes(payload_hash(event.payload), prev_hash)
-        if e.seq != seq + 1:
-            raise LedgerError("SEQUENCE_MISMATCH")
-        events.append(e)
-        return e
+        return self.append_batch([event], expected_seq)[0]
+
+    def append_batch(self, events: list[Event], expected_seq: int) -> list[Event]:
+        """Validate the whole batch before exposing any financial effects."""
+        if not events:
+            return []
+        with self._lock:
+            run_id = events[0].run_id
+            seq, prev_hash = self.tip(run_id)
+            if expected_seq != seq:
+                raise LedgerError("SEQUENCE_MISMATCH")
+            committed: list[Event] = []
+            for event in events:
+                if event.run_id != run_id or event.seq != seq + 1:
+                    raise LedgerError("SEQUENCE_MISMATCH")
+                e = deepcopy(event).with_hashes(payload_hash(event.payload), prev_hash)
+                committed.append(e)
+                seq, prev_hash = e.seq, e.event_hash
+            self._events.setdefault(run_id, []).extend(committed)
+            return deepcopy(committed)
 
     def events(self, run_id: str) -> list[Event]:
-        return list(self._events.get(run_id, []))
+        return deepcopy(self._events.get(run_id, []))
 
     def tip(self, run_id: str) -> tuple[int, str]:
         events = self._events.get(run_id, [])

@@ -108,7 +108,7 @@ def test_settlement_lookup(dataset):
     root, _, _ = dataset
     arc = Archive(root)
     s = arc.settlement_for(date(2019, 2, 15))
-    assert s is not None and s["value_index_points"] > 0
+    assert s is None  # generator must not invent settlement beyond its observed sessions
     arc.close()
 
 

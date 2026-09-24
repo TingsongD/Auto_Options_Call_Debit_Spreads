@@ -227,9 +227,9 @@ class TestAssessmentAndQuarantine:
 
     def test_assessment_round_trip(self) -> None:
         led, h, ctx, comp = self._compiled()
-        premise = comp.public["premises"][0]["token"]
+        premise = comp.public["action_menu"][0]["required_premise_tokens"][0]
         proposal = {
-            "schema_version": "2.0",
+            "schema_version": "2.1",
             "actor_role": "SPREAD",
             "decision_token": comp.public["decision_token"],
             "packet_token": comp.public["packet_token"],
@@ -542,13 +542,9 @@ class TestPacketSemantics:
             premise_ids={a.atom_id for a in atoms2},
             prior_belief_hash=prior.belief_hash,
         )
-        assert comp.public["prior_belief_token"] == h.token(
-            "run-1:main", "bel", prior.belief_hash
-        )
+        assert comp.public["prior_belief_token"] == h.token("run-1:main", "bel", prior.belief_hash)
         post = reduce_belief(led, h, ctx2)
-        assert comp.public["prior_belief_token"] != h.token(
-            "run-1:main", "bel", post.belief_hash
-        )
+        assert comp.public["prior_belief_token"] != h.token("run-1:main", "bel", post.belief_hash)
 
     def test_carried_assessments_capped_at_16(self) -> None:
         led = InMemoryObservationLedger()
@@ -597,9 +593,7 @@ class TestPacketSemantics:
         assert "PAUSE_NEW_ALLOCATIONS" not in kinds
         assert "ALLOCATE" not in kinds  # no allocation while paused
 
-        met = ManagerView(
-            **{**base, "paused": False, "active_bullish": 2, "active_bearish": 1}
-        )
+        met = ManagerView(**{**base, "paused": False, "active_bullish": 2, "active_bearish": 1})
         kinds = {m.kind for m in manager_menu(met, manager_atoms(met, T0))}
         assert "ALLOCATE" not in kinds  # targets met — nothing to allocate
         assert "NO_CHANGE" in kinds

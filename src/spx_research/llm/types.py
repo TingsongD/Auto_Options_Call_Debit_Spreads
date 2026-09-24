@@ -1,56 +1,62 @@
-"""Model gateway types (M4-01).
-
-A ``ModelRequest`` is fully determined by (system prompt id, packet, schema,
-model id) — its hash is the decision-tape key and the retry/budget identity.
-Provider continuation state, opaque reasoning replay, and uninspected
-compaction are structurally absent from the request shape.
-"""
+"""Standalone, canonical model requests and usage-bearing outcomes."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from decimal import Decimal
-from typing import Any
+from typing import Any, Literal
 
-from spx_research.epistemics.harness import digest
+from spx_research.epistemics.harness import canonical, digest
+
+ProviderOutcome = Literal["COMPLETED", "FAILED", "REPLAYED"]
 
 
 class ModelError(ValueError):
-    """Fixed codes: REFUSAL, TIMEOUT, SCHEMA, TRANSPORT, INCOMPLETE,
-    RATE_LIMIT, BUDGET_EXCEEDED, TAPE_MISS, REAL_CALLS_DISABLED."""
-
-    def __init__(self, code: str) -> None:
+    def __init__(self, code: str, *, billing_uncertain: bool = False) -> None:
         super().__init__(code)
         self.code = code
+        self.billing_uncertain = billing_uncertain
 
 
 @dataclass(frozen=True)
 class ModelRequest:
-    system_prompt_id: str  # versioned prompt name from the spec package
-    packet: dict[str, Any]  # blinded public packet (already egress-checked)
-    schema_name: str  # "spread_decision" | "manager_decision"
+    system_prompt_id: str
+    packet: dict[str, Any]
+    schema_name: str
     model_id: str
     max_output_tokens: int = 800
-    system_prompt_hash: str = ""  # sha256 of the loaded prompt bytes
-    schema_hash: str = ""  # canonical digest of the loaded output schema
-    retry_error_code: str = ""  # retries carry only the prior failure's code
+    system_prompt_hash: str = ""
+    schema_hash: str = ""
+    retry_error_code: str = ""
+    system_text: str = ""
+    output_schema: dict[str, Any] | None = None
 
     def request_hash(self) -> str:
-        return (
-            "req_"
-            + digest(
-                [
-                    self.system_prompt_id,
-                    self.system_prompt_hash,
-                    self.packet,
-                    self.schema_name,
-                    self.schema_hash,
-                    self.model_id,
-                    self.max_output_tokens,
-                    self.retry_error_code,
-                ]
-            )[:24]
-        )
+        return "req_" + digest(asdict(self))
+
+    def body(self, system_text: str = "", schema: dict[str, Any] | None = None) -> dict[str, Any]:
+        prompt = self.system_text or system_text
+        output = self.output_schema if self.output_schema is not None else schema
+        content = canonical(self.packet).decode()
+        if self.retry_error_code:
+            # Only locally generated, bounded fixed codes enter a retry.
+            if not all(c.isupper() or c.isdigit() or c in "_:" for c in self.retry_error_code):
+                raise ModelError("INVALID_RETRY_CODE")
+            content += "\nRETRY_ERROR_CODE=" + self.retry_error_code
+        return {
+            "model": self.model_id,
+            "input": [{"role": "system", "content": prompt}, {"role": "user", "content": content}],
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": self.schema_name,
+                    "schema": output or {},
+                    "strict": True,
+                }
+            },
+            "max_output_tokens": self.max_output_tokens,
+            "store": False,
+        }
 
 
 @dataclass(frozen=True)
@@ -63,21 +69,21 @@ class ModelResponse:
     output_tokens: int
     cost_usd: Decimal
     provider_metadata: dict[str, Any] | None = None
+    outcome: ProviderOutcome = "COMPLETED"
+    error_code: str = ""
+    billing_uncertain: bool = False
+    cached_input_tokens: int = 0
+
+
+def response_dict(response: ModelResponse) -> dict[str, Any]:
+    result = asdict(response)
+    result["cost_usd"] = str(response.cost_usd)
+    return result
+
+
+def response_from_dict(raw: dict[str, Any]) -> ModelResponse:
+    return ModelResponse(**{**raw, "cost_usd": Decimal(str(raw["cost_usd"]))})
 
 
 def request_body(req: ModelRequest, system_text: str) -> dict[str, Any]:
-    """Provider-neutral request body — deliberately no continuation fields.
-
-    On a retry the body carries the prior failure's *code* only — never the
-    rejected prose, which stays quarantined to the private incident vault.
-    """
-    body = {
-        "system": system_text,
-        "packet": req.packet,
-        "schema_name": req.schema_name,
-        "model": req.model_id,
-        "max_output_tokens": req.max_output_tokens,
-    }
-    if req.retry_error_code:
-        body["retry_error_code"] = req.retry_error_code
-    return body
+    return req.body(system_text)

@@ -59,7 +59,18 @@ def summarize(result: RunResult) -> dict[str, Any]:
     closed = [e for e in events if e.type == "POSITION_CLOSED"]
     settled = [e for e in events if e.type == "POSITION_SETTLED"]
     return {
+        "schema_version": "2.1",
         "run_id": result.run_id,
+        "status": result.status,
+        "pause": result.pause,
+        "research_validity": result.research_validity,
+        "classification": "HISTORICAL_ASOF_BLINDED_PARAMETRIC_RISK_UNRESOLVED",
+        "application_temporal_gate": "NOT_RUN",
+        "behavioral_leakage_diagnostics": "NOT_RUN",
+        "model_temporal_provenance": "UNKNOWN",
+        "parametric_future_knowledge_excluded": False,
+        "study_label": "HISTORICAL_ASOF_BLINDED_PARAMETRIC_RISK_UNRESOLVED",
+        "parametric_ignorance_proven": False,
         "events": len(events),
         "event_types": by_type,
         "agents_total": len(st.agents),
@@ -69,6 +80,18 @@ def summarize(result: RunResult) -> dict[str, Any]:
         "final_cash_usd": str(st.account.cash),
         "reserved_usd": str(st.account.reserved),
         "fees_paid_usd": str(st.account.fees_paid),
+        "trading_fees_usd": str(st.account.fees_paid),
+        "open_positions": len(st.open_positions()),
+        "valuations": result.valuations,
+        "final_valuation": result.valuations[-1] if result.valuations else None,
+        "scored_end_valuation": result.scored_end_valuation,
+        "runoff": result.runoff_summary,
+        "coverage": {
+            "status": "UNAVAILABLE"
+            if result.pause and result.pause.get("category") == "DATA"
+            else "OBSERVED_ONLY",
+            "events": [e.payload for e in events if "COVERAGE" in e.type or "DATA_GAP" in e.type],
+        },
         "decisions": len(result.decisions),
         "rejections": sum(1 for d in result.decisions if "rejected" in d),
     }
@@ -80,3 +103,37 @@ def replay_summary(
     """Fold the committed log; returns state + log digest (no model calls)."""
     st = replay(run_id, initial_cash, events)
     return st, event_log_digest(events)
+
+
+def attempt_summary(journal: list[dict[str, Any]]) -> dict[str, Any]:
+    """Account for failed and unresolved calls as well as accepted proposals."""
+    attempts: dict[str, dict[str, Any]] = {}
+    for row in journal:
+        payload = row["payload"]
+        if row["kind"] == "ATTEMPT_RESERVED":
+            attempts[payload["attempt_id"]] = {"outcome": "DISPATCH_RESERVED", **payload}
+        elif row["kind"] == "ATTEMPT_COMPLETED":
+            attempts.setdefault(payload["attempt_id"], {}).update(payload)
+        elif row["kind"] == "ATTEMPT_RECONCILED":
+            attempts.setdefault(payload["attempt_id"], {}).update(
+                outcome="RECONCILED",
+                actual_usd=payload.get("actual_usd"),
+            )
+    counts: dict[str, int] = {}
+    tokens = {"input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0}
+    unknown_usage = 0
+    for item in attempts.values():
+        outcome = str(item["outcome"])
+        counts[outcome] = counts.get(outcome, 0) + 1
+        response = (item.get("response") or {}).get("model_response")
+        if response is None or response.get("billing_uncertain"):
+            unknown_usage += 1
+        if response:
+            for key in tokens:
+                tokens[key] += int(response.get(key, 0))
+    return {
+        "attempt_count": len(attempts),
+        "outcomes": counts,
+        "reported_usage": tokens,
+        "unknown_usage_attempts": unknown_usage,
+    }

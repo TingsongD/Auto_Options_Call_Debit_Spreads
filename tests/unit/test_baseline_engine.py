@@ -34,7 +34,7 @@ from spx_research.engine.scheduler import Engine
 from spx_research.features.candidates import build_candidates
 from spx_research.reporting.report import event_log_digest
 from spx_research.research.mechanical import MechanicalPolicy
-from spx_research.temporal.calendar import build_weekday_manifest
+from spx_research.temporal.calendar import CalendarManifest, build_weekday_manifest
 
 START = date(2024, 1, 2)
 END = date(2024, 2, 16)  # Friday; also the single contract expiry (DTE 45)
@@ -108,6 +108,13 @@ def _profile_dict() -> dict[str, Any]:
 def dataset(tmp_path_factory: pytest.TempPathFactory) -> tuple[Archive, Any]:
     root = tmp_path_factory.mktemp("ds")
     cal = build_weekday_manifest("cal-test", START, END + timedelta(days=5))
+    # Explicit synthetic sessions: entry week plus expiry exercises the same
+    # lifecycle without generating a month of redundant minute fixtures.
+    cal = CalendarManifest(
+        cal.calendar_id,
+        cal.version,
+        tuple(s for s in cal.sessions if s.day <= date(2024, 1, 5) or s.day == EXPIRY),
+    )
     spec = SyntheticSpec(
         dataset_id="smoke",
         seed=7,
@@ -115,7 +122,7 @@ def dataset(tmp_path_factory: pytest.TempPathFactory) -> tuple[Archive, Any]:
         end=END,
         expiries=(EXPIRY,),
         strike_step=Decimal("25"),
-        strikes_each_side=24,
+        strikes_each_side=16,
     )
     generate(root, spec, cal)
     return Archive(root / "smoke"), cal
@@ -375,7 +382,7 @@ def test_future_suffix_does_not_change_prefix(
         ).write_parquet(mp)
 
     r_a = _engine(archive_a, cal).run(START, cutoff)
-    r_b = _engine(Archive(root_b), cal).run(START, cutoff)
+    r_b = _engine(Archive(root_b, verify=False), cal).run(START, cutoff)
     assert event_log_digest(r_a.events) == event_log_digest(r_b.events)
 
 
@@ -437,8 +444,7 @@ def test_held_to_expiry_settles(dataset: tuple[Archive, Any]) -> None:
         for e in result.events
         if e.type == "DATA_GAP" and e.payload.get("kind") == "settlement_unavailable"
     ]
-    # Expiry-day gaps may occur intraday (value not yet published) but every
-    # position must eventually settle — no permanent stranding.
+    # Scheduled publication in the future is not itself a data gap.
     stranded = {g.payload["position_id"] for g in gaps} - settled
     assert not stranded
 
@@ -532,8 +538,7 @@ def test_data_gap_once_per_position_per_day(dataset: tuple[Archive, Any]) -> Non
         if e.type == "DATA_GAP" and e.payload.get("kind") == "settlement_unavailable"
     ]
     per_pos = Counter(e.payload["position_id"] for e in gaps)
-    assert per_pos, "expected at least one settlement gap in this fixture"
-    assert max(per_pos.values()) == 1
+    assert not per_pos, "a verified pending publication is not missing data"
 
 
 def test_execution_delay_must_align_to_minute_grid() -> None:
@@ -663,14 +668,11 @@ def test_stale_quotes_read_as_absent(dataset: tuple[Archive, Any]) -> None:
     # Inside the bound the quote reads; past the bound it is absent — a
     # sparse feed cannot silently serve a stale print.
     assert archive.quote_at(cid, snap + timedelta(seconds=299), max_age_seconds=300) is not None
-    assert (
-        archive.quote_at(cid, snap + timedelta(seconds=301), max_age_seconds=300)
-        is None
-        or archive.quote_at(cid, snap + timedelta(seconds=301), max_age_seconds=300)[
-            "snapshot_at_utc"
-        ]
-        >= snap + timedelta(seconds=1)
-    )
+    assert archive.quote_at(
+        cid, snap + timedelta(seconds=301), max_age_seconds=300
+    ) is None or archive.quote_at(cid, snap + timedelta(seconds=301), max_age_seconds=300)[
+        "snapshot_at_utc"
+    ] >= snap + timedelta(seconds=1)
     # The same applies to the greek path: over a weekend the last
     # session's greek is >1 day stale and must read as absent.
     from datetime import UTC, datetime

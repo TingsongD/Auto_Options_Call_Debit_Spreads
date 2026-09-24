@@ -54,6 +54,15 @@ class SpreadView:
     candidates: tuple[Candidate, ...]
     entry_limit_templates: tuple[LimitTemplate, ...]
     exit_limit_templates: tuple[LimitTemplate, ...]
+    equity_usd: Decimal | None = None
+    as_of_dte: int | None = None
+    advisory_profit_low: Decimal = Decimal("0.3")
+    advisory_profit_high: Decimal = Decimal("0.4")
+    advisory_loss_low: Decimal = Decimal("0.2")
+    advisory_loss_high: Decimal = Decimal("0.3")
+    loss_activation_days: int = 25
+    macro_facts: tuple[dict[str, Any], ...] = ()
+    spot_points: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -72,6 +81,7 @@ class ManagerView:
     available_usd: Decimal
     reservations: tuple[Reservation, ...]
     macro_facts: tuple[dict[str, Any], ...] = ()
+    equity_usd: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -87,6 +97,9 @@ class DecisionContext:
     minute_from_open: int
     spread_view: SpreadView | None = None
     manager_view: ManagerView | None = None
+    base_ledger_seq: int = 0
+    base_ledger_hash: str = "genesis"
+    barrier_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -126,8 +139,10 @@ def validate_spread_proposal(ctx: DecisionContext, p: Proposal) -> None:
     if view is None:
         raise Rejection("NO_SPREAD_VIEW")
     state = view.agent.state.name
+    if p.allocation or p.retire_reservation_ids:
+        raise Rejection("SPREAD_FIELDS")
     if p.kind == "WAIT":
-        if state != "SEEKING_ENTRY" or p.candidate_id or p.position_id:
+        if state != "SEEKING_ENTRY" or p.candidate_id or p.position_id or p.limit_template_id:
             raise Rejection("WAIT_FIELDS")
     elif p.kind == "OPEN":
         if state != "SEEKING_ENTRY":
@@ -138,8 +153,10 @@ def validate_spread_proposal(ctx: DecisionContext, p: Proposal) -> None:
             raise Rejection("UNKNOWN_CANDIDATE")
         if p.limit_template_id not in {t.template_id for t in view.entry_limit_templates}:
             raise Rejection("UNKNOWN_LIMIT_TEMPLATE")
+        if p.limit_template_id != f"entry:{p.candidate_id}":
+            raise Rejection("CANDIDATE_LIMIT_MISMATCH")
     elif p.kind == "HOLD":
-        if state != "OPEN" or not p.position_id or p.candidate_id:
+        if state != "OPEN" or not p.position_id or p.candidate_id or p.limit_template_id:
             raise Rejection("HOLD_FIELDS")
         if view.position is None or view.position.position_id != p.position_id:
             raise Rejection("NOT_OWN_POSITION")
@@ -160,10 +177,16 @@ def validate_manager_proposal(ctx: DecisionContext, p: Proposal) -> None:
     view = ctx.manager_view
     if view is None:
         raise Rejection("NO_MANAGER_VIEW")
+    if p.candidate_id or p.position_id or p.limit_template_id:
+        raise Rejection("MANAGER_FIELDS")
     if p.kind == "ALLOCATE":
-        if not p.allocation or set(p.allocation) - {"bullish", "bearish"}:
+        if (
+            not p.allocation
+            or set(p.allocation) - {"bullish", "bearish"}
+            or p.retire_reservation_ids
+        ):
             raise Rejection("ALLOCATE_FIELDS")
-        if any(not isinstance(v, int) or v < 0 for v in p.allocation.values()):
+        if any(type(v) is not int or v <= 0 for v in p.allocation.values()):
             raise Rejection("ALLOCATE_FIELDS")
         if view.paused:
             raise Rejection("ALLOCATIONS_PAUSED")
@@ -172,12 +195,23 @@ def validate_manager_proposal(ctx: DecisionContext, p: Proposal) -> None:
         ) + (view.active_bearish + view.reserved_bearish + p.allocation.get("bearish", 0))
         if committed > view.capacity:
             raise Rejection("CAPACITY_EXCEEDED")
+        if (
+            view.active_bullish + view.reserved_bullish + p.allocation.get("bullish", 0)
+            > view.bullish_target
+            or view.active_bearish + view.reserved_bearish + p.allocation.get("bearish", 0)
+            > view.bearish_target
+        ):
+            raise Rejection("ALLOCATION_TARGET_EXCEEDED")
     elif p.kind == "RETIRE_SEARCH_SLOTS":
         if p.allocation:
             raise Rejection("RETIRE_FIELDS")
         live = {r.reservation_id for r in view.reservations if r.status.name == "SEEKING_ENTRY"}
         if not set(p.retire_reservation_ids) <= live:
             raise Rejection("UNKNOWN_RESERVATION")
+        if not p.retire_reservation_ids or len(set(p.retire_reservation_ids)) != len(
+            p.retire_reservation_ids
+        ):
+            raise Rejection("RETIRE_FIELDS")
     elif p.kind in ("PAUSE_NEW_ALLOCATIONS", "RESUME_NEW_ALLOCATIONS", "NO_CHANGE"):
         if p.allocation or p.retire_reservation_ids or p.candidate_id:
             raise Rejection("FIELDS_NOT_EMPTY")

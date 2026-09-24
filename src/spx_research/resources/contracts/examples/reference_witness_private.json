@@ -1,0 +1,26 @@
+{
+  "schema_version": "2.1",
+  "private_decision_id": "dec_b9d16d25a4ff6a966835ee96",
+  "run_id": "private-2019-run",
+  "branch_id": "branch-one",
+  "actor_id": "worker",
+  "as_of_utc": "2019-01-02T15:00:00+00:00",
+  "packet_hash": "7046814479d41e7529aa82acee83ca680d6cdc8471a0fbb4887d9b6937c1dfe2",
+  "prior_belief_hash": "empty",
+  "proposal_hash": "4b914e9720f36b476cb7d993b607895f85e938bcf5d02c4134ef0f8046ab0237",
+  "accepted_premise_ids": [
+    "rate",
+    "rule"
+  ],
+  "max_evidence_available_at_utc": "2019-01-02T14:45:00+00:00",
+  "checks": [
+    {
+      "name": "reference_structural_subset",
+      "status": "PASS"
+    }
+  ],
+  "status": "ACCEPTED",
+  "rejection_codes": [],
+  "validator_version": "reference-0.1",
+  "parametric_ignorance_proven": false
+}
